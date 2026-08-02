@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -219,7 +220,7 @@ namespace MinecraftClient.Mapping
                 // Return if goal found and no maxOffset was given OR current node is between minOffset and maxOffset
                 if ((current.Location == goalLower && maxOffset <= 0) ||
                     (maxOffset > 0 && current.HScore >= minOffset && current.HScore <= maxOffset))
-                    return ReconstructPath(cameFrom, current.Location, start, goal);
+                    return SimplifyPath(world, ReconstructPath(cameFrom, current.Location, start, goal));
 
                 // Discover neighbored blocks
                 foreach (Location neighbor in GetAvailableMoves(world, current.Location, allowUnsafe))
@@ -249,9 +250,115 @@ namespace MinecraftClient.Mapping
             // Goal could not be reached. Set the path to the closest location if close enough
             if (current is not null && openSet.MinHScoreNode is not null &&
                 (maxOffset == int.MaxValue || openSet.MinHScoreNode.HScore <= maxOffset))
-                return ReconstructPath(cameFrom, openSet.MinHScoreNode.Location, start, goal);
+                return SimplifyPath(world, ReconstructPath(cameFrom, openSet.MinHScoreNode.Location, start, goal));
 
             return null;
+        }
+
+        /// <summary>
+        /// Check whether the player can walk in a straight line between two locations
+        /// on the same horizontal plane without colliding with solid blocks.
+        /// Used for path smoothing and for skipping corner waypoints during execution.
+        /// </summary>
+        /// <param name="world">World</param>
+        /// <param name="from">Start location (player feet position)</param>
+        /// <param name="to">Destination location (player feet position)</param>
+        /// <param name="playerRadius">Horizontal half-width of the player collision box</param>
+        /// <returns>True when the straight segment is walkable</returns>
+        public static bool CanTravelStraight(World world, Location from, Location to, double playerRadius = 0.3)
+        {
+            if (Math.Abs(from.Y - to.Y) > 0.01)
+                return false; // Smoothing is limited to same-plane segments for now
+
+            double dx = to.X - from.X;
+            double dz = to.Z - from.Z;
+            double distance = Math.Sqrt(dx * dx + dz * dz);
+            if (distance < 1e-6)
+                return true;
+
+            // Sample the segment at least every quarter block
+            int steps = Math.Max(1, (int)Math.Ceiling(distance / 0.25));
+            for (int i = 0; i <= steps; i++)
+            {
+                double t = (double)i / steps;
+                double px = from.X + dx * t;
+                double pz = from.Z + dz * t;
+
+                // Every block column touched by the player's collision box must be walkable
+                int minX = (int)Math.Floor(px - playerRadius);
+                int maxX = (int)Math.Floor(px + playerRadius);
+                int minZ = (int)Math.Floor(pz - playerRadius);
+                int maxZ = (int)Math.Floor(pz + playerRadius);
+                for (int blockX = minX; blockX <= maxX; blockX++)
+                {
+                    for (int blockZ = minZ; blockZ <= maxZ; blockZ++)
+                    {
+                        if (!IsWalkableColumn(world, new Location(blockX, from.Y, blockZ)))
+                            return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Remove unnecessary waypoints from a path by collapsing straight,
+        /// collision-free segments. Keeps the path honest: corners are preserved
+        /// whenever cutting them would clip a solid block.
+        /// </summary>
+        /// <param name="world">World</param>
+        /// <param name="path">Path to simplify</param>
+        /// <returns>Simplified path with the same start and end waypoints</returns>
+        public static Queue<Location> SimplifyPath(World world, Queue<Location> path)
+        {
+            if (path.Count <= 2)
+                return path;
+
+            List<Location> waypoints = path.ToList();
+            List<Location> simplified = new() { waypoints[0] };
+
+            int anchorIndex = 0;
+            for (int candidateIndex = 1; candidateIndex < waypoints.Count; candidateIndex++)
+            {
+                Location anchor = waypoints[anchorIndex];
+                Location candidate = waypoints[candidateIndex];
+
+                // Keep the previous waypoint when the direct segment is blocked
+                if (!CanTravelStraight(world, anchor, candidate))
+                {
+                    int keptIndex = candidateIndex - 1;
+                    if (keptIndex > anchorIndex)
+                    {
+                        simplified.Add(waypoints[keptIndex]);
+                        anchorIndex = keptIndex;
+                    }
+                }
+            }
+
+            if (simplified.Last() != waypoints[^1])
+                simplified.Add(waypoints[^1]);
+
+            return new Queue<Location>(simplified);
+        }
+
+        /// <summary>
+        /// Check whether the player's body (feet block and the block above) fits in a
+        /// block column at the given feet position, and the column is fully loaded.
+        /// </summary>
+        private static bool IsWalkableColumn(World world, Location feet)
+        {
+            ChunkColumn? chunkColumn = world.GetChunkColumn(feet);
+            if (chunkColumn is null || !chunkColumn.FullyLoaded)
+                return false;
+
+            Block feetBlock = world.GetBlock(feet);
+            Block headBlock = world.GetBlock(Move(feet, Direction.Up));
+            if (feetBlock.Type.IsSolid() || headBlock.Type.IsSolid())
+                return false;
+
+            // Climbable columns (ladders, vines) are walkable even when partially solid
+            return true;
         }
 
         /// <summary>
@@ -645,9 +752,12 @@ namespace MinecraftClient.Mapping
                              !world.GetBlock(Move(location, Direction.Up)).Type.IsSolid();
 
             // Handle slabs
-            if (!isNotSolid && world.GetBlock(Move(location, Direction.Up))
-                    .IsTopSlab(McClient.Instance!.GetProtocolVersion()))
+            int? protocolVersion = McClient.Instance?.GetProtocolVersion();
+            if (!isNotSolid && protocolVersion is not null &&
+                world.GetBlock(Move(location, Direction.Up)).IsTopSlab(protocolVersion.Value))
+            {
                 isNotSolid = true;
+            }
 
             return canClimb || isNotSolid;
         }

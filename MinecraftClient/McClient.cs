@@ -3567,6 +3567,22 @@ namespace MinecraftClient
                     path = null;
                 }
             }
+            else if (pathTarget is not null && path is not null && path.Count > 0)
+            {
+                // Corner recovery: close to the current waypoint but blocked from reaching
+                // its exact center (e.g. turning around a wall). Skip it when the straight
+                // line to the following waypoint is actually walkable.
+                Location next = path.Peek();
+                double curDx = pathTarget.Value.X - location.X;
+                double curDz = pathTarget.Value.Z - location.Z;
+                if (curDx * curDx + curDz * curDz < 0.5625 &&
+                    Movement.CanTravelStraight(world, location, next))
+                {
+                    pathTarget = path.Dequeue();
+                    if (Config.Main.Advanced.MoveHeadWhileWalking)
+                        UpdateLocation(location, pathTarget.Value + new Location(0, 1, 0));
+                }
+            }
 
             // Need a first target from a fresh path
             if (pathTarget is null && path is not null && path.Count > 0)
@@ -3589,7 +3605,7 @@ namespace MinecraftClient
         {
             double dx = target.X - location.X;
             double dz = target.Z - location.Z;
-            return dx * dx + dz * dz < 0.25; // within ~0.5 blocks horizontally
+            return dx * dx + dz * dz < 0.49; // within ~0.7 blocks horizontally
         }
 
         /// <summary>
