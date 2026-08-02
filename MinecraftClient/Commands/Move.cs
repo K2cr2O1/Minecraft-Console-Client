@@ -157,7 +157,10 @@ namespace MinecraftClient.Commands
 
             Location goal = Movement.Move(handler.GetCurrentLocation(), direction);
 
-            if (!Movement.CheckChunkLoading(handler.GetWorld(), handler.GetCurrentLocation(), goal))
+            // Risk mode (-f) is an explicit exploration override: allow routing into
+            // not-yet-loaded chunks; the bot loads terrain as it walks and the
+            // stuck-detector re-plans if the path turns out wrong.
+            if (!takeRisk && !Movement.CheckChunkLoading(handler.GetWorld(), handler.GetCurrentLocation(), goal))
                 return r.SetAndReturn(Status.FailChunkNotLoad, string.Format(Translations.cmd_move_chunk_not_loaded, goal.X, goal.Y, goal.Z));
 
             if (Movement.CanMove(handler.GetWorld(), handler.GetCurrentLocation(), direction))
@@ -182,7 +185,7 @@ namespace MinecraftClient.Commands
             Location current = handler.GetCurrentLocation(), currentCenter = current.ToCenter();
             goal.ToAbsolute(current);
 
-            if (!Movement.CheckChunkLoading(handler.GetWorld(), current, goal))
+            if (!takeRisk && !Movement.CheckChunkLoading(handler.GetWorld(), current, goal))
                 return r.SetAndReturn(Status.FailChunkNotLoad, string.Format(Translations.cmd_move_chunk_not_loaded, goal.X, goal.Y, goal.Z));
 
             if (takeRisk || Movement.PlayerFitsHere(handler.GetWorld(), goal))

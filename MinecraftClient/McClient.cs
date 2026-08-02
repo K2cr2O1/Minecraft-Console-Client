@@ -3756,6 +3756,12 @@ namespace MinecraftClient
                 return;
             }
 
+            ConsoleIO.WriteLineFormatted(
+                $"§d[MCC] Stuck telemetry: pos=({location.X:F2},{location.Y:F2},{location.Z:F2}) " +
+                $"waypoint=({(pathTarget is Location wp ? $"{wp.X:F2},{wp.Y:F2},{wp.Z:F2}" : "none")}) " +
+                $"ground={playerPhysics.OnGround} colH={playerPhysics.HorizontalCollision} " +
+                $"climb={playerPhysics.OnClimbable} swim={playerPhysics.InWater}");
+
             // Recompute asynchronously with the full budget instead of blocking the
             // client for a few seconds (the maze search needs much more than 2s).
             ConsoleIO.WriteLineFormatted("§e[MCC] Movement stuck; recomputing path in the background...");
@@ -3823,17 +3829,17 @@ namespace MinecraftClient
                 double centerZ = Math.Floor(location.Z) + 0.5;
                 double offX = centerX - location.X;
                 double offZ = centerZ - location.Z;
-                if (Math.Abs(offX) > 0.25
+                if (Math.Abs(offX) > 0.2
                     && IsCliffSide(world, location, Direction.East)
                     && IsCliffSide(world, location, Direction.West))
                 {
-                    steerX = offX * 1.0;
+                    steerX = offX * 1.8;
                 }
-                if (Math.Abs(offZ) > 0.25
+                if (Math.Abs(offZ) > 0.2
                     && IsCliffSide(world, location, Direction.North)
                     && IsCliffSide(world, location, Direction.South))
                 {
-                    steerZ = offZ * 1.0;
+                    steerZ = offZ * 1.8;
                 }
             }
 
