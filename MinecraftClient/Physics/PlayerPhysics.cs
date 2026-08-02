@@ -146,7 +146,7 @@ namespace MinecraftClient.Physics
                 // Jump in fluid: add upward impulse
                 DeltaMovement = DeltaMovement.Add(0, PhysicsConsts.WaterFloatImpulse, 0);
             }
-            else if (OnGround && noJumpDelay == 0)
+            else if ((OnGround || OnClimbable) && noJumpDelay == 0)
             {
                 JumpFromGround();
                 noJumpDelay = 10;
@@ -211,18 +211,24 @@ namespace MinecraftClient.Physics
             Vec3d postMoveVel = DeltaMovement;
             double vy = postMoveVel.Y;
 
-            // Climbing wall bump
-            if ((HorizontalCollision || Jumping) && OnClimbable)
-            {
-                vy = PhysicsConsts.ClimbWallBump;
+            // Climbing bump: on a ladder with any movement input, push upward.
+           {
+                bool wantsToMove = Xxa != 0.0f || Zza != 0.0f;
+                if (OnClimbable && (HorizontalCollision || Jumping || wantsToMove))
+                    vy = PhysicsConsts.ClimbWallBump;
             }
 
-            // Apply gravity
+            // Apply gravity. While standing over unloaded/unknown columns the
+            // client cache cannot prove there is no floor (GetBlock returns Air
+            // for missing chunks), so falling here fights the server's position
+            // corrections every tick and kills horizontal velocity. Treat unknown
+            // ground as standing until the chunk streams in — matching the
+            // pathfinder's IsOnGround rule for unloaded chunks.
             if (HasLevitation)
             {
                 vy += (0.05 * (LevitationAmplifier + 1) - vy) * 0.2;
             }
-            else
+            else if (!HasUnknownGround(world))
             {
                 vy -= GetEffectiveGravity();
             }
@@ -370,6 +376,12 @@ namespace MinecraftClient.Physics
             VerticalCollisionBelow = VerticalCollision && movement.Y < 0.0;
             OnGround = VerticalCollisionBelow;
 
+            // Unloaded/unknown columns count as standing ground so the bot can
+            // walk into streaming terrain at full speed instead of hovering in a
+            // server-correction loop.
+            if (!OnGround && HasUnknownGround(world))
+                OnGround = true;
+
             // Fall distance tracking
             if (OnGround)
                 FallDistance = 0;
@@ -390,6 +402,25 @@ namespace MinecraftClient.Physics
                 // Slime block bounce would go here; for now just zero Y
                 DeltaMovement = new Vec3d(DeltaMovement.X, 0, DeltaMovement.Z);
             }
+        }
+
+        /// <summary>
+        /// Whether the columns under the player's feet are not fully loaded yet.
+        /// GetBlock returns Air for missing chunks, so an absence of blocks here
+        /// proves nothing about the real terrain.
+        /// </summary>
+        private bool HasUnknownGround(World world)
+        {
+            Location feet = new Location(
+                Math.Floor(Position.X), Math.Floor(Position.Y), Math.Floor(Position.Z));
+            for (int d = 1; d <= 3; d++)
+            {
+                Location below = Movement.Move(feet, Direction.Down, d);
+                ChunkColumn? column = world.GetChunkColumn(below);
+                if (column is null || column.GetChunk(below) is null)
+                    return true;
+            }
+            return false;
         }
 
         /// <summary>

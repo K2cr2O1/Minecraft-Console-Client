@@ -239,7 +239,7 @@ namespace MinecraftClient.Mapping
         /// <param name="ct">Token for stopping computation after a certain time</param>
         /// <returns>A list of locations, or null if calculation failed</returns>
         public static Queue<Location>? CalculatePath(World world, Location start, Location goal, bool allowUnsafe,
-            int maxOffset, int minOffset, CancellationToken ct)
+            int maxOffset, int minOffset, CancellationToken ct, int maxNodes = 0)
         {
             // This is a bad configuration
             if (minOffset > maxOffset)
@@ -249,7 +249,7 @@ namespace MinecraftClient.Mapping
             // goal. Used only for unsafe (exploration) searches without offsets,
             // where the reverse generator exactly mirrors the forward edges.
             if (allowUnsafe && maxOffset <= 0 && minOffset <= 0)
-                return CalculatePathBidirectional(world, start, goal, ct);
+                return CalculatePathBidirectional(world, start, goal, ct, maxNodes);
 
             // Round start coordinates for easier calculation
             Location startLower = start.ToFloor();
@@ -290,6 +290,13 @@ namespace MinecraftClient.Mapping
                     continue;
                 current = entry.Loc;
                 LastExpandedNodes++;
+
+                // Node budget: stop expanding when the search grows too large.
+                // The best-progress node seen so far becomes a partial path so the
+                // bot can walk to the loaded terrain edge and re-plan there
+                // (incremental / on-the-way planning for very distant goals).
+                if (maxNodes > 0 && LastExpandedNodes >= maxNodes)
+                    break;
 
                 int currentH = Heuristic(current, goalLower);
                 if (currentH < closestH)
@@ -341,7 +348,7 @@ namespace MinecraftClient.Mapping
         /// forward search.
         /// </summary>
         private static Queue<Location>? CalculatePathBidirectional(
-            World world, Location start, Location goal, CancellationToken ct)
+            World world, Location start, Location goal, CancellationToken ct, int maxNodes)
         {
             Location startLower = start.ToFloor();
             Location goalLower = goal.ToFloor();
@@ -362,9 +369,17 @@ namespace MinecraftClient.Mapping
             HashSet<Location> closedBackward = new();
             Location? meeting = null;
             int meetingCost = int.MaxValue;
+            // Best forward-progress node (start side only, so it is always
+            // reachable from the start): used to emit a partial path when the node
+            // budget runs out before the frontiers meet.
+            Location bestProgress = startLower;
+            int bestProgressH = Heuristic(startLower, goalLower);
 
             while (openForward.Count > 0 && openBackward.Count > 0 && !ct.IsCancellationRequested)
             {
+                if (maxNodes > 0 && LastExpandedNodes >= maxNodes)
+                    break;
+
                 if (!openForward.TryPeek(out _, out int fForward)
                     || !openBackward.TryPeek(out _, out int fBackward))
                     break;
@@ -385,6 +400,12 @@ namespace MinecraftClient.Mapping
                     if (!closedForward.Add(entry.Loc))
                         continue;
                     LastExpandedNodes++;
+                    int h = Heuristic(entry.Loc, goalLower);
+                    if (h < bestProgressH)
+                    {
+                        bestProgressH = h;
+                        bestProgress = entry.Loc;
+                    }
 
                     if (closedBackward.Contains(entry.Loc))
                     {
@@ -437,7 +458,14 @@ namespace MinecraftClient.Mapping
             }
 
             if (meeting is null)
+            {
+                // Budget exhausted before the frontiers met: return the best
+                // reachable prefix so the bot makes progress toward the goal and
+                // re-plans from there with fresher chunk data.
+                if (maxNodes > 0 && bestProgress != startLower)
+                    return SimplifyPath(world, ReconstructPath(cameFromForward, bestProgress, start, goal));
                 return null;
+            }
 
             // Reconstruct: start -> meeting (forward), then meeting -> goal (backward)
             List<Location> path = new();
@@ -664,6 +692,18 @@ namespace MinecraftClient.Mapping
             return column is not null && column.FullyLoaded;
         }
 
+        /// <summary>
+        /// Whether the block data for this cell actually exists in the cache.
+        /// A column can be marked FullyLoaded while individual Y sections are
+        /// still missing (GetBlock then reports Air for real terrain), so both
+        /// must be checked before treating Air as proven void.
+        /// </summary>
+        private static bool HasBlockData(World world, Location loc)
+        {
+            ChunkColumn? column = world.GetChunkColumn(loc);
+            return column is not null && column.GetChunk(loc) is not null;
+        }
+
         private static bool IsOpenCell(World world, Location cell)
         {
             return IsLoaded(world, cell) && PlayerFitsHere(world, cell);
@@ -847,12 +887,12 @@ namespace MinecraftClient.Mapping
         /// </summary>
         private static bool HasSupportWithin(World world, Location feet, int depth)
         {
-            if (!IsLoaded(world, feet))
+            if (!HasBlockData(world, feet))
                 return true;
             for (int d = 1; d <= depth; d++)
             {
                 Location below = Move(feet, Direction.Down, d);
-                if (!IsLoaded(world, below))
+                if (!HasBlockData(world, below))
                     return true;
                 if (world.GetBlock(below).Type.IsSolid() || IsClimbing(world, below))
                     return true;

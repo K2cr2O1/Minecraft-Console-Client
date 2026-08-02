@@ -146,6 +146,12 @@ namespace MinecraftClient.Physics
                     for (int by = minBY; by <= maxBY; by++)
                     {
                         Block block = world.GetBlock(new Location(bx, by, bz));
+                        // Climbable blocks (ladders, vines) are not physical
+                        // colliders: the player moves through them and climbs by
+                        // pushing against the wall behind them. Treating them as
+                        // solid boxes wedges the bot inside the ladder column.
+                        if (block.Type.CanBeClimbedOn())
+                            continue;
                         Aabb[] shapes = BlockShapes.GetShapes(block);
 
                         foreach (var shape in shapes)

@@ -86,6 +86,8 @@ namespace MinecraftClient
         private CancellationTokenSource? pathSearchCts; // Async path search state
         private Task<Queue<Location>?>? pathSearchTask;
         private Location? movementGoal; // Original movement goal, kept for stuck re-planning
+        private Location? movementFinalGoal; // Final goal across incremental path segments
+        private int pathSegmentCount;
         private bool movementAllowUnsafe;
         private int movementMaxOffset;
         private int movementMinOffset;
@@ -96,10 +98,19 @@ namespace MinecraftClient
         private int movementDebugTicks;
         private int wallUnstickTicks;
         private float wallUnstickYaw;
+        private int wallUnstickSide = 1;
+        private int chunkWaitTicks;
+        private int serverBlockTicks;
+        private int ladderSide = 1;
+        private int ladderNoProgressTicks;
+        private double ladderLastY;
         private const int PathStuckThresholdTicks = 60; // ~3 seconds at 20 TPS
         private const int MaxReplansWithoutProgress = 5;
         private const double PathProgressEpsilonSqr = 0.0025; // ~0.05 blocks of progress
-        private const double WaypointVerticalTolerance = 0.6; // roughly one block level
+        private const int PathSearchNodeBudget = 400000; // nodes per search before emitting a partial path
+        private const int MaxPathSegments = 20;
+        private const int PathChunkWaitMaxTicks = 1200; // 60s of chunk-stream wait before re-planning anyway
+        private const double WaypointVerticalTolerance = 0.8; // roughly one block level
         public enum MovementType { Sneak, Walk, Sprint }
         private int sequenceId; // User for player block synchronization (Aka. digging, placing blocks, etc..)
         private bool CanSendMessage = false;
@@ -1808,28 +1819,41 @@ namespace MinecraftClient
                 }
                 else
                 {
-                    movementGoal = goal;
-                    movementAllowUnsafe = allowUnsafe;
-                    movementMaxOffset = maxOffset;
-                    movementMinOffset = minOffset;
-                    replanCount = 0;
-                    lastReplanGoalDistanceSqr = goal.Distance(location);
-                    pathTarget = null;
-                    path = null;
-                    CancelPendingPathSearch();
-                    pathSearchCts = new CancellationTokenSource();
-                    pathSearchCts.CancelAfter(timeout ?? TimeSpan.FromSeconds(120));
-                    Location startLocation = location;
-                    pathSearchTask = Task.Run(
-                        () => Movement.CalculatePath(
-                            world, startLocation, goal, allowUnsafe, maxOffset, minOffset, pathSearchCts.Token),
-                        pathSearchCts.Token);
+                    movementFinalGoal = goal;
+                    pathSegmentCount = 0;
+                    StartPathSearch(goal, allowUnsafe, maxOffset, minOffset, timeout ?? TimeSpan.FromSeconds(300));
                     ConsoleIO.WriteLineFormatted("§e[MCC] Searching for a path...");
                     lastWaypointDistanceSqr = double.MaxValue;
                     pathStuckTicks = 0;
                     return true; // path is computed asynchronously
                 }
             }
+        }
+
+        /// <summary>
+        /// Kick off an asynchronous path search with the node budget. Used by
+        /// MoveTo, incremental segment continuation and stuck re-planning.
+        /// Must be called while holding locationLock.
+        /// </summary>
+        private void StartPathSearch(Location goal, bool allowUnsafe, int maxOffset, int minOffset, TimeSpan timeout, int nodeBudget = PathSearchNodeBudget)
+        {
+            movementGoal = goal;
+            movementAllowUnsafe = allowUnsafe;
+            movementMaxOffset = maxOffset;
+            movementMinOffset = minOffset;
+            replanCount = 0;
+            lastReplanGoalDistanceSqr = goal.Distance(location);
+            pathTarget = null;
+            path = null;
+            CancelPendingPathSearch();
+            pathSearchCts = new CancellationTokenSource();
+            pathSearchCts.CancelAfter(timeout);
+            Location startLocation = location;
+            pathSearchTask = Task.Run(
+                () => Movement.CalculatePath(
+                    world, startLocation, goal, allowUnsafe, maxOffset, minOffset,
+                    pathSearchCts.Token, nodeBudget),
+                pathSearchCts.Token);
         }
 
         /// <summary>
@@ -3628,7 +3652,11 @@ namespace MinecraftClient
                     {
                         pathTarget = path.Dequeue();
                         ResetPathProgress(pathTarget.Value);
-                        replanCount = 0;
+                        // Do NOT reset replanCount here: MoveTo already resets it on
+                        // a fresh command, and ReplanMovement relies on it to cancel
+                        // after MaxReplansWithoutProgress. Resetting it after every
+                        // successful background search let a genuinely stuck bot
+                        // replan forever (each search re-arms the counter).
                         ConsoleIO.WriteLineFormatted(
                             $"§e[MCC] Path found ({path.Count} waypoints, nodes={Movement.LastExpandedNodes}).");
                     }
@@ -3636,6 +3664,8 @@ namespace MinecraftClient
                     {
                         pathTarget = null;
                         movementGoal = null;
+                        movementFinalGoal = null;
+                        pathSegmentCount = 0;
                         ConsoleIO.WriteLineFormatted(
                             $"§c[MCC] Failed to compute path to target (nodes={Movement.LastExpandedNodes}). Run /move again.");
                     }
@@ -3663,6 +3693,29 @@ namespace MinecraftClient
                     pathTarget = null;
                     path = null;
                     movementGoal = null;
+                    // Incremental planning: the path may have ended early at the
+                    // node-budget frontier. If the final goal is not reached yet,
+                    // start the next segment from the current (better-loaded)
+                    // position instead of declaring the movement finished.
+                    if (movementFinalGoal is Location fg
+                        && fg.DistanceSquared(location) > 1.0
+                        && pathSegmentCount < MaxPathSegments)
+                    {
+                        pathSegmentCount++;
+                        ConsoleIO.WriteLineFormatted(
+                            $"§e[MCC] Segment {pathSegmentCount}/{MaxPathSegments} reached; re-planning toward final goal...");
+                        // Later segments see more loaded terrain but still have a
+                        // long way to go; give them a larger node budget than the
+                        // first segment so the frontier keeps advancing.
+                        StartPathSearch(
+                            fg, movementAllowUnsafe, movementMaxOffset, movementMinOffset,
+                            TimeSpan.FromSeconds(300), PathSearchNodeBudget * 2);
+                    }
+                    else
+                    {
+                        movementFinalGoal = null;
+                        pathSegmentCount = 0;
+                    }
                 }
             }
             else if (pathTarget is not null && path is not null && path.Count > 0)
@@ -3715,21 +3768,66 @@ namespace MinecraftClient
                 {
                     lastWaypointDistanceSqr = distSqr;
                     pathStuckTicks = 0;
+                    chunkWaitTicks = 0;
+                    serverBlockTicks = 0;
                 }
-                else if (playerPhysics.OnGround && pathStuckTicks > PathStuckThresholdTicks)
+                else if (distSqr > lastWaypointDistanceSqr + 0.5)
+                {
+                    // The server pushed the bot back (real wall/void boundary):
+                    // client physics thinks it can advance but the server rejects
+                    // the position. A few such bounces in a row mean the route is
+                    // blocked server-side, so re-plan instead of pushing forever.
+                    serverBlockTicks++;
+                    if (serverBlockTicks > 30)
+                    {
+                        serverBlockTicks = 0;
+                        ReplanMovement();
+                        return;
+                    }
+                }
+                else if (pathStuckTicks > PathStuckThresholdTicks)
                 {
                     ReplanMovement();
                     return;
                 }
-                else if (playerPhysics.OnGround)
+                else if (!playerPhysics.OnClimbable)
                 {
-                    // Only count stuck time while on the ground: airborne time is
-                    // legitimate jump/climb progress (e.g. escaping a 1-block pit).
-                    pathStuckTicks++;
+                    // Climbing a ladder is legitimate progress even though the
+                    // horizontal distance to the waypoint barely changes; counting
+                    // it as stuck would replan, null the path target, and let
+                    // server position packets teleport the bot back down.
+                    // An unloaded chunk ahead also pauses the counter briefly —
+                    // the server streams terrain as the bot walks — but only for a
+                    // bounded wait; after that it is treated as a real stall so a
+                    // bot pushing against a chunk boundary eventually re-plans.
+                    if (IsAheadChunkLoading() && chunkWaitTicks < PathChunkWaitMaxTicks)
+                        chunkWaitTicks++;
+                    else
+                    {
+                        chunkWaitTicks = 0;
+                        pathStuckTicks++;
+                    }
                 }
 
                 SetInputToward(pathTarget.Value);
             }
+        }
+
+        /// <summary>
+        /// Whether the chunk a few blocks ahead of the bot (in the current heading
+        /// direction) is still not fully loaded. The server sends chunks around the
+        /// player, so walking into unknown terrain loads it on the way; counting
+        /// that wait as "stuck" would cancel navigation at every terrain frontier.
+        /// </summary>
+        private bool IsAheadChunkLoading()
+        {
+            double yawRad = playerYaw * (Math.PI / 180.0);
+            Location ahead = new(
+                Math.Floor(location.X - Math.Sin(yawRad) * 8.0),
+                Math.Floor(location.Y),
+                Math.Floor(location.Z + Math.Cos(yawRad) * 8.0));
+            ChunkColumn? column = world.GetChunkColumn(ahead);
+            return column is null || column.GetChunk(ahead) is null;
         }
 
         /// <summary>
@@ -3789,17 +3887,7 @@ namespace MinecraftClient
             // Recompute asynchronously with the full budget instead of blocking the
             // client for a few seconds (the maze search needs much more than 2s).
             ConsoleIO.WriteLineFormatted("§e[MCC] Movement stuck; recomputing path in the background...");
-            path = null;
-            pathTarget = null;
-            CancelPendingPathSearch();
-            pathSearchCts = new CancellationTokenSource();
-            pathSearchCts.CancelAfter(TimeSpan.FromSeconds(120));
-            Location startLocation = location;
-            pathSearchTask = Task.Run(
-                () => Movement.CalculatePath(
-                    world, startLocation, goal, movementAllowUnsafe, movementMaxOffset, movementMinOffset,
-                    pathSearchCts.Token),
-                pathSearchCts.Token);
+            StartPathSearch(goal, movementAllowUnsafe, movementMaxOffset, movementMinOffset, TimeSpan.FromSeconds(300));
         }
 
         /// <summary>
@@ -3838,8 +3926,117 @@ namespace MinecraftClient
             double dz = target.Z - location.Z;
             double dy = target.Y - location.Y;
             double distSqr = dx * dx + dz * dz;
+            Location feetCell = new(
+                Math.Floor(location.X), Math.Floor(location.Y), Math.Floor(location.Z));
 
-            if (distSqr < 0.01) return; // Close enough horizontally
+            // Ladder climbing: when the waypoint is above and a ladder is in the
+            // current or an adjacent cell, commit to the climb. First walk to the
+            // ladder cell center (a 1-wide ladder is easy to slide off from its
+            // edge), then face the wall behind the ladder and hold W so the
+            // physics engine climbs while colliding with it. This must run before
+            // the horizontal-close early return (on the ladder the bot is
+            // horizontally at the waypoint but still needs to go up) and before
+            // unstick/centering, which would pull the bot away from the ladder.
+            if (dy > 0.5 || world.GetBlock(feetCell).Type.CanBeClimbedOn())
+            {
+                bool feetIsLadder = world.GetBlock(feetCell).Type.CanBeClimbedOn();
+                if (feetIsLadder)
+                {
+                    Location ladder = feetCell;
+
+                    // 1) Center on the ladder cell first: from the edge the bot
+                    // clips the ladder column and gets pushed sideways mid-climb.
+                    double centerX = ladder.X + 0.5 - location.X;
+                    double centerZ = ladder.Z + 0.5 - location.Z;
+                    if (centerX * centerX + centerZ * centerZ > 0.0064)
+                    {
+                        float centerYaw = (float)(-Math.Atan2(centerX, centerZ) / Math.PI * 180.0);
+                        if (centerYaw < 0) centerYaw += 360;
+                        playerPhysics.Yaw = centerYaw;
+                        playerYaw = playerPhysics.Yaw;
+                        _yaw = null;
+                        _pitch = null;
+                        physicsInput.Forward = true;
+                        return;
+                    }
+
+                    // 2) Centered: face the ladder face and hold W so the climb
+                    // bump kicks in. The ladder's facing is not available in the
+                    // block cache, so infer it (the open side opposite the solid
+                    // backing wall) and adapt: if the chosen side produces no
+                    // upward progress for ~1.5s, flip to the other side.
+                    if (location.Y > ladderLastY + 0.05)
+                    {
+                        ladderLastY = location.Y;
+                        ladderNoProgressTicks = 0;
+                    }
+                    else if (++ladderNoProgressTicks > 30)
+                    {
+                        ladderNoProgressTicks = 0;
+                        ladderSide = -ladderSide;
+                    }
+                    foreach (Direction dir in new[] { Direction.East, Direction.West, Direction.North, Direction.South })
+                    {
+                        Location side = Movement.Move(ladder, dir);
+                        if (world.GetBlock(side).Type.IsSolid())
+                        {
+                            Direction climbDir = ladderSide > 0 ? OppositeDir(dir) : dir;
+                            playerPhysics.Yaw = DirToYaw(climbDir);
+                            playerYaw = playerPhysics.Yaw;
+                            _yaw = null;
+                            _pitch = null;
+                            physicsInput.Forward = true;
+                            return;
+                        }
+                    }
+                    // Floating ladder: keep the current heading and just push up.
+                    physicsInput.Forward = true;
+                    return;
+                }
+                else
+                {
+                    bool belowLadder =
+                        world.GetBlock(Movement.Move(feetCell, Direction.Down)).Type.CanBeClimbedOn()
+                        || world.GetBlock(Movement.Move(feetCell, Direction.Down, 2)).Type.CanBeClimbedOn();
+                    if (belowLadder)
+                    {
+                        // Just climbed out of the top ladder cell: jump off toward
+                        // the waypoint so the bot lands on the platform above the
+                        // ladder instead of hovering and sliding back down.
+                        float exitYaw = (float)(-Math.Atan2(dx, dz) / Math.PI * 180.0);
+                        if (exitYaw < 0) exitYaw += 360;
+                        playerPhysics.Yaw = exitYaw;
+                        playerYaw = exitYaw;
+                        _yaw = null;
+                        _pitch = null;
+                        physicsInput.Forward = true;
+                        if (dy > 0.5)
+                            physicsInput.Jump = true;
+                        return;
+                    }
+
+                    // Not on a ladder yet: walk toward an adjacent ladder cell to
+                    // start the climb.
+                    foreach (Direction dir in new[] { Direction.East, Direction.West, Direction.North, Direction.South })
+                    {
+                        Location side = Movement.Move(feetCell, dir);
+                        if (world.GetBlock(side).Type.CanBeClimbedOn())
+                        {
+                            float centerYaw = (float)(-Math.Atan2(
+                                side.X + 0.5 - location.X, side.Z + 0.5 - location.Z) / Math.PI * 180.0);
+                            if (centerYaw < 0) centerYaw += 360;
+                            playerPhysics.Yaw = centerYaw;
+                            playerYaw = playerPhysics.Yaw;
+                            _yaw = null;
+                            _pitch = null;
+                            physicsInput.Forward = true;
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if (distSqr < 0.01) return; // Close enough horizontally (no climb needed)
 
             // Stay centered on 1-wide catwalks/platforms: when the current cell has
             // cliffs on both sides of an axis, blend the heading with a correction
@@ -3874,7 +4071,7 @@ namespace MinecraftClient
                 // every tick aborts the escape as soon as the collision flickers off,
                 // so once triggered we commit to the unstick heading for a short
                 // burst (12 ticks) and skip the waypoint bearing during it.
-                if (playerPhysics.HorizontalCollision)
+                if (playerPhysics.HorizontalCollision && wallUnstickTicks == 0)
                 {
                     if (offX * offX + offZ * offZ > 0.0025)
                     {
@@ -3882,15 +4079,18 @@ namespace MinecraftClient
                         if (wallUnstickYaw < 0) wallUnstickYaw += 360;
                         wallUnstickTicks = 12;
                     }
-                    else if (wallUnstickTicks == 0)
+                    else
                     {
-                        // Off-center enough to act on? No: collision at the exact
-                        // cell center (wedged in a tight gap) — try perpendicular
-                        // to the waypoint bearing instead.
+                        // Collision at/near the exact cell center (wedged in a
+                        // tight gap): try the perpendicular to the waypoint
+                        // bearing, alternating sides between attempts so a corner
+                        // that blocks one side gets a chance on the other.
                         float waypointYaw = (float)(-Math.Atan2(dx, dz) / Math.PI * 180.0);
                         if (waypointYaw < 0) waypointYaw += 360;
-                        wallUnstickYaw = waypointYaw + 90;
+                        wallUnstickSide = -wallUnstickSide;
+                        wallUnstickYaw = waypointYaw + 90 * wallUnstickSide;
                         if (wallUnstickYaw >= 360) wallUnstickYaw -= 360;
+                        else if (wallUnstickYaw < 0) wallUnstickYaw += 360;
                         wallUnstickTicks = 12;
                     }
                 }
@@ -4010,6 +4210,33 @@ namespace MinecraftClient
         }
 
         /// <summary>
+        /// Yaw that makes the player move straight in the given direction
+        /// (yaw 0 = +Z/south, 90 = -X/west, 180 = -Z/north, 270 = +X/east).
+        /// </summary>
+        private static float DirToYaw(Direction dir)
+        {
+            return dir switch
+            {
+                Direction.East => 270f,
+                Direction.West => 90f,
+                Direction.North => 180f,
+                _ => 0f,
+            };
+        }
+
+        private static Direction OppositeDir(Direction dir)
+        {
+            return dir switch
+            {
+                Direction.East => Direction.West,
+                Direction.West => Direction.East,
+                Direction.North => Direction.South,
+                Direction.South => Direction.North,
+                _ => dir,
+            };
+        }
+
+        /// <summary>
         /// Check if the client is currently processing a Movement.
         /// </summary>
         /// <returns>true if a movement is currently handled</returns>
@@ -4040,6 +4267,8 @@ namespace MinecraftClient
             path = null;
             pathTarget = null;
             movementGoal = null;
+            movementFinalGoal = null;
+            pathSegmentCount = 0;
             CancelPendingPathSearch();
             return success;
         }
@@ -4103,7 +4332,20 @@ namespace MinecraftClient
         {
             _yaw = yaw;
             _pitch = pitch;
-            UpdateLocation(location, false);
+            // While a path is active the local physics engine is authoritative:
+            // the server echoes our own packets back with small deltas, and
+            // Teleport() zeroes velocity, which cancels ladder climbing and
+            // corner corrections every tick (the bot gets pinned to the last
+            // server-known Y and never climbs). Only honor large jumps (e.g.
+            // teleports, respawns, chunk-boundary corrections).
+            bool pathActive = pathTarget is not null || pathSearchTask is not null;
+            bool farFromPhysics = physicsInitialized
+                && new Location(
+                    playerPhysics.Position.X,
+                    playerPhysics.Position.Y,
+                    playerPhysics.Position.Z).DistanceSquared(location) >= 4.0;
+            if (!pathActive || !physicsInitialized || farFromPhysics)
+                UpdateLocation(location, false);
         }
 
         /// <summary>
