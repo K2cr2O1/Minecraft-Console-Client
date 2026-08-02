@@ -93,6 +93,9 @@ namespace MinecraftClient
         private double lastReplanGoalDistanceSqr = double.MaxValue;
         private int pathStuckTicks;
         private int replanCount;
+        private int movementDebugTicks;
+        private int wallUnstickTicks;
+        private float wallUnstickYaw;
         private const int PathStuckThresholdTicks = 60; // ~3 seconds at 20 TPS
         private const int MaxReplansWithoutProgress = 5;
         private const double PathProgressEpsilonSqr = 0.0025; // ~0.05 blocks of progress
@@ -703,9 +706,16 @@ namespace MinecraftClient
                     // Navigate pathfinding: set input based on current path
                     UpdatePathfindingInput();
 
-                    // Sync yaw/pitch if explicitly set (by commands/bots)
-                    if (_yaw is not null) playerPhysics.Yaw = _yaw.Value;
-                    if (_pitch is not null) playerPhysics.Pitch = _pitch.Value;
+                    // Sync yaw/pitch if explicitly set (by commands/bots) — but
+                    // never while a path is active: server position packets and
+                    // MoveHeadWhileWalking pin _yaw (yaw=0 is a valid non-null
+                    // value) and would cancel the movement heading every tick.
+                    bool pathActive = pathTarget is not null || pathSearchTask is not null;
+                    if (!pathActive)
+                    {
+                        if (_yaw is not null) playerPhysics.Yaw = _yaw.Value;
+                        if (_pitch is not null) playerPhysics.Pitch = _pitch.Value;
+                    }
 
                     // Update environment flags (water, lava, climbable)
                     playerPhysics.UpdateEnvironment(world);
@@ -722,8 +732,8 @@ namespace MinecraftClient
                         playerPhysics.Position.Y,
                         playerPhysics.Position.Z);
 
-                    playerYaw = _yaw ?? playerYaw;
-                    playerPitch = _pitch ?? playerPitch;
+                    playerYaw = !pathActive && _yaw is not null ? _yaw.Value : playerYaw;
+                    playerPitch = !pathActive && _pitch is not null ? _pitch.Value : playerPitch;
 
                     // Send position packet
                     handler.SendLocationUpdate(location, playerPhysics.OnGround, playerPhysics.HorizontalCollision, _yaw, _pitch);
@@ -1803,7 +1813,7 @@ namespace MinecraftClient
                     movementMaxOffset = maxOffset;
                     movementMinOffset = minOffset;
                     replanCount = 0;
-                    lastReplanGoalDistanceSqr = goal.DistanceSquared(location);
+                    lastReplanGoalDistanceSqr = goal.Distance(location);
                     pathTarget = null;
                     path = null;
                     CancelPendingPathSearch();
@@ -3686,6 +3696,16 @@ namespace MinecraftClient
 
             if (pathTarget is not null)
             {
+                if (++movementDebugTicks % 40 == 0)
+                {
+                    ConsoleIO.WriteLineFormatted(
+                        $"§d[MCC] mv pos=({location.X:F2},{location.Y:F2},{location.Z:F2}) " +
+                        $"tgt=({pathTarget.Value.X:F1},{pathTarget.Value.Y:F1},{pathTarget.Value.Z:F1}) " +
+                        $"in=(f{physicsInput.Forward},j{physicsInput.Jump},s{physicsInput.Sneak},S{physicsInput.Sprint}) " +
+                        $"vel=({playerPhysics.DeltaMovement.X:F3},{playerPhysics.DeltaMovement.Y:F3},{playerPhysics.DeltaMovement.Z:F3}) " +
+                        $"yaw={playerYaw:F0}");
+                }
+
                 // Stuck detection: the bot fell off the path or is blocked by a wall.
                 // Re-plan from the current position instead of jumping forever.
                 double dx = pathTarget.Value.X - location.X;
@@ -3737,12 +3757,16 @@ namespace MinecraftClient
                 return;
             }
 
-            double goalDistanceSqr = goal.DistanceSquared(location);
-            if (goalDistanceSqr < lastReplanGoalDistanceSqr - 1.0)
+            // Use linear distance, not squared: with a far goal the squared metric
+            // makes a tiny shuffle near the player count as >1 block of progress
+            // (lever arm), so the retry counter would never reach its limit and the
+            // bot would re-plan forever at a genuinely stuck spot.
+            double goalDistance = goal.Distance(location);
+            if (goalDistance < lastReplanGoalDistanceSqr - 1.0)
             {
                 // More than one block of net progress toward the goal since the last
                 // re-plan: the re-plans are helping, so give the bot fresh attempts.
-                lastReplanGoalDistanceSqr = goalDistanceSqr;
+                lastReplanGoalDistanceSqr = goalDistance;
                 replanCount = 0;
             }
 
@@ -3841,6 +3865,49 @@ namespace MinecraftClient
                 {
                     steerZ = offZ * 1.8;
                 }
+
+                // Wall graze recovery: when horizontally colliding (e.g. a corner
+                // block at head level while straddling a cell boundary), slide
+                // back toward the current cell center so the bot clears the corner
+                // instead of pushing into it forever. A small additive steer is
+                // diluted by a far-away waypoint in the atan2 blend, and re-evaluating
+                // every tick aborts the escape as soon as the collision flickers off,
+                // so once triggered we commit to the unstick heading for a short
+                // burst (12 ticks) and skip the waypoint bearing during it.
+                if (playerPhysics.HorizontalCollision)
+                {
+                    if (offX * offX + offZ * offZ > 0.0025)
+                    {
+                        wallUnstickYaw = (float)(-Math.Atan2(offX, offZ) / Math.PI * 180.0);
+                        if (wallUnstickYaw < 0) wallUnstickYaw += 360;
+                        wallUnstickTicks = 12;
+                    }
+                    else if (wallUnstickTicks == 0)
+                    {
+                        // Off-center enough to act on? No: collision at the exact
+                        // cell center (wedged in a tight gap) — try perpendicular
+                        // to the waypoint bearing instead.
+                        float waypointYaw = (float)(-Math.Atan2(dx, dz) / Math.PI * 180.0);
+                        if (waypointYaw < 0) waypointYaw += 360;
+                        wallUnstickYaw = waypointYaw + 90;
+                        if (wallUnstickYaw >= 360) wallUnstickYaw -= 360;
+                        wallUnstickTicks = 12;
+                    }
+                }
+                if (wallUnstickTicks > 0)
+                {
+                    wallUnstickTicks--;
+                    playerPhysics.Yaw = wallUnstickYaw;
+                    playerYaw = wallUnstickYaw;
+                    _yaw = null;
+                    physicsInput.Forward = true;
+                    // Map MovementSpeed setting: 1=sneak, 2-4=walk, 5=sprint
+                    if (Config.Main.Advanced.MovementSpeed >= 5)
+                        physicsInput.Sprint = true;
+                    else if (Config.Main.Advanced.MovementSpeed <= 1)
+                        physicsInput.Sneak = true;
+                    return;
+                }
             }
 
             // Calculate yaw to face target (with centerline correction)
@@ -3848,6 +3915,14 @@ namespace MinecraftClient
             if (targetYaw < 0) targetYaw += 360;
             playerPhysics.Yaw = targetYaw;
             playerYaw = targetYaw;
+
+            // Path execution owns the heading while walking: MoveHeadWhileWalking
+            // pins _yaw to the raw waypoint bearing and server position packets can
+            // pin it to a stale yaw, both of which would cancel the corrected
+            // movement yaw every tick. Clearing it lets playerPhysics.Yaw (set
+            // above, with centerline/unstick corrections) actually drive movement.
+            _yaw = null;
+            _pitch = null;
 
             physicsInput.Forward = true;
 
@@ -3875,12 +3950,14 @@ namespace MinecraftClient
                 }
             }
 
-            // Edge probe: never walk forward into a cell with no ground within
-            // 2 blocks below it. On 1-wide platforms (rooftops, catwalks) the path
-            // may lead straight toward or past the edge; stepping off must be
-            // detected before the bot falls. 1-2 block drops stay allowed (the
-            // physics handles those), deeper drops are treated as cliffs.
-            if (playerPhysics.OnGround && physicsInput.Forward)
+            // Edge probe: never walk forward into a cell with no ground within the
+            // fall limit below it. Safe mode uses 3 blocks (matching the safe
+            // pathfinder). Risk mode (-f) skips the probe entirely: the client-side
+            // block cache is frequently stale/incomplete compared to the server
+            // (loaded chunks report Air for real floor), so only the server physics
+            // and the stuck-detector can judge those cells; blocking on the cache
+            // makes the bot freeze at every corridor edge.
+            if (!movementAllowUnsafe && playerPhysics.OnGround && physicsInput.Forward)
             {
                 double yawRad = playerYaw * (Math.PI / 180.0);
                 double forwardX = -Math.Sin(yawRad);
@@ -3892,11 +3969,20 @@ namespace MinecraftClient
                     Math.Floor(location.Y),
                     Math.Floor(location.Z + forwardZ * 0.7));
                 if (aheadCell != currentCell
-                    && !world.GetBlock(aheadCell).Type.IsSolid()
-                    && !world.GetBlock(Movement.Move(aheadCell, Direction.Down)).Type.IsSolid()
-                    && !world.GetBlock(Movement.Move(aheadCell, Direction.Down, 2)).Type.IsSolid())
+                    && !world.GetBlock(aheadCell).Type.IsSolid())
                 {
-                    physicsInput.Forward = false;
+                    int fallLimit = 3;
+                    bool hasGround = false;
+                    for (int depth = 1; depth <= fallLimit; depth++)
+                    {
+                        if (world.GetBlock(Movement.Move(aheadCell, Direction.Down, depth)).Type.IsSolid())
+                        {
+                            hasGround = true;
+                            break;
+                        }
+                    }
+                    if (!hasGround)
+                        physicsInput.Forward = false;
                 }
             }
 
@@ -3909,7 +3995,8 @@ namespace MinecraftClient
 
         /// <summary>
         /// Check whether the adjacent cell in the given direction is a cliff:
-        /// non-solid at feet level with no ground within 2 blocks below it.
+        /// non-solid at feet level with no ground within 3 blocks below it
+        /// (matches the pathfinder safety rule).
         /// </summary>
         private bool IsCliffSide(World world, Location location, Direction direction)
         {
@@ -3918,7 +4005,8 @@ namespace MinecraftClient
                 return false; // wall, not a cliff
 
             return !world.GetBlock(Movement.Move(side, Direction.Down)).Type.IsSolid()
-                && !world.GetBlock(Movement.Move(side, Direction.Down, 2)).Type.IsSolid();
+                && !world.GetBlock(Movement.Move(side, Direction.Down, 2)).Type.IsSolid()
+                && !world.GetBlock(Movement.Move(side, Direction.Down, 3)).Type.IsSolid();
         }
 
         /// <summary>

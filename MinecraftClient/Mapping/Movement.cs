@@ -20,6 +20,11 @@ namespace MinecraftClient.Mapping
         /// Integer scale for pathfinding costs and heuristics (1 block = 1000).
         /// </summary>
         private const int MoveCostScale = 1000;
+        /// <summary>
+        /// Max fall distance allowed in risk mode (-f): landing platforms up to
+        /// this many blocks below are acceptable, provably bottomless cells are not.
+        /// </summary>
+        private const int UnsafeFallDepth = 5;
 
         /* ========= PATHFINDING METHODS ========= */
 
@@ -473,7 +478,11 @@ namespace MinecraftClient.Mapping
             })
             {
                 Location source = Move(node, Opposite(dir));
-                if (CanWalkHorizontally(world, source, dir))
+                // Mirror the forward-edge rule used in risk mode: the destination
+                // (node) must have a landing within UnsafeFallDepth or unknown
+                // terrain; provably bottomless cells have no reverse edge either.
+                if (CanWalkHorizontally(world, source, dir)
+                    && HasSupportWithin(world, node, UnsafeFallDepth))
                     yield return source;
             }
 
@@ -489,7 +498,8 @@ namespace MinecraftClient.Mapping
 
             // 3. Fall/climb reverse: the cell directly above can drop onto node.
             Location above = Move(node, Direction.Up);
-            if (!IsOnGround(world, above) && !IsSwimming(world, above))
+            if (!IsOnGround(world, above) && !IsSwimming(world, above)
+                && HasSupportWithin(world, node, UnsafeFallDepth))
                 yield return above;
         }
 
@@ -540,13 +550,18 @@ namespace MinecraftClient.Mapping
                     yield return jumpPoint.Value;
             }
 
-            // Walking off an edge into an unsupported air cell (starts a fall)
+            // Walking off an edge into an unsupported air cell (starts a fall).
+            // Safe mode requires a landing within IsSafe's 3-block rule. Risk mode
+            // (-f) relaxes that to UnsafeFallDepth, but still refuses cells that are
+            // provably bottomless in loaded terrain: those are voids, not drops.
+            // Not-yet-loaded cells are treated as unknown and allowed, matching the
+            // exploration semantics of -f (terrain streams in as the bot walks).
             foreach (Direction dir in new[] { Direction.East, Direction.West, Direction.North, Direction.South })
             {
                 Location side = Move(node, dir);
                 if (CanWalkHorizontally(world, node, dir) && !IsWalkableColumn(world, side))
                 {
-                    if (allowUnsafe || IsSafe(world, side))
+                    if (allowUnsafe ? HasSupportWithin(world, side, UnsafeFallDepth) : IsSafe(world, side))
                         yield return side;
                 }
             }
@@ -823,6 +838,26 @@ namespace MinecraftClient.Mapping
                 || IsClimbing(world, Move(feet, Direction.Down))
                 || IsClimbing(world, Move(feet, Direction.Down, 2))
                 || IsClimbing(world, Move(feet, Direction.Down, 3));
+        }
+
+        /// <summary>
+        /// Whether the column below `feet` has solid/climbable support within
+        /// `depth` blocks. Unloaded terrain counts as unknown (supported), not as
+        /// void, so -f exploration can walk into chunks that are still streaming in.
+        /// </summary>
+        private static bool HasSupportWithin(World world, Location feet, int depth)
+        {
+            if (!IsLoaded(world, feet))
+                return true;
+            for (int d = 1; d <= depth; d++)
+            {
+                Location below = Move(feet, Direction.Down, d);
+                if (!IsLoaded(world, below))
+                    return true;
+                if (world.GetBlock(below).Type.IsSolid() || IsClimbing(world, below))
+                    return true;
+            }
+            return false;
         }
 
         /// <summary>
