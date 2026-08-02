@@ -11,6 +11,16 @@ namespace MinecraftClient.Mapping
     /// </summary>
     public static class Movement
     {
+        /// <summary>
+        /// Number of nodes expanded by the most recent CalculatePath call (diagnostics).
+        /// </summary>
+        public static long LastExpandedNodes;
+
+        /// <summary>
+        /// Integer scale for pathfinding costs and heuristics (1 block = 1000).
+        /// </summary>
+        private const int MoveCostScale = 1000;
+
         /* ========= PATHFINDING METHODS ========= */
 
         /// <summary>
@@ -62,8 +72,22 @@ namespace MinecraftClient.Mapping
                 foreach (Direction dir in Enum.GetValues(typeof(Direction)))
                 {
                     Location dest = Move(location, dir);
-                    if (CanMove(world, location, dir) && (allowUnsafe || IsSafe(world, dest)))
+                    bool diagonalSafe = !IsDiagonal(dir)
+                        || (IsSafe(world, Move(location, DiagonalCardinalA(dir)))
+                            && IsSafe(world, Move(location, DiagonalCardinalB(dir))));
+                    if (CanMove(world, location, dir) && (allowUnsafe || (IsSafe(world, dest) && diagonalSafe)))
                         availableMoves.Add(dest);
+                }
+
+                // Step-up: jump onto a 1-high solid block in an adjacent cell.
+                // Without this diagonal-up transition the pathfinder can only plan
+                // same-column jumps into mid-air, which the bot can never land on,
+                // so it can never climb stairs or escape pits.
+                foreach (Direction dir in new[] { Direction.East, Direction.West, Direction.North, Direction.South })
+                {
+                    Location stepUp = Move(Move(location, dir), Direction.Up);
+                    if (CanStepUp(world, location, dir) && (allowUnsafe || IsSafe(world, stepUp)))
+                        availableMoves.Add(stepUp);
                 }
             }
             else
@@ -76,6 +100,36 @@ namespace MinecraftClient.Mapping
             }
 
             return availableMoves;
+        }
+
+        private static bool IsDiagonal(Direction direction)
+        {
+            return direction == Direction.NorthEast || direction == Direction.SouthEast
+                || direction == Direction.SouthWest || direction == Direction.NorthWest;
+        }
+
+        private static Direction DiagonalCardinalA(Direction direction)
+        {
+            return direction switch
+            {
+                Direction.NorthEast => Direction.North,
+                Direction.SouthEast => Direction.South,
+                Direction.SouthWest => Direction.South,
+                Direction.NorthWest => Direction.North,
+                _ => throw new ArgumentException("Not a diagonal direction", nameof(direction))
+            };
+        }
+
+        private static Direction DiagonalCardinalB(Direction direction)
+        {
+            return direction switch
+            {
+                Direction.NorthEast => Direction.East,
+                Direction.SouthEast => Direction.East,
+                Direction.SouthWest => Direction.West,
+                Direction.NorthWest => Direction.West,
+                _ => throw new ArgumentException("Not a diagonal direction", nameof(direction))
+            };
         }
 
         /// <summary>
@@ -186,73 +240,476 @@ namespace MinecraftClient.Mapping
             if (minOffset > maxOffset)
                 throw new ArgumentException("minOffset must be lower or equal to maxOffset", nameof(minOffset));
 
+            // Bidirectional A*: forward JPS from the start, backward search from the
+            // goal. Used only for unsafe (exploration) searches without offsets,
+            // where the reverse generator exactly mirrors the forward edges.
+            if (allowUnsafe && maxOffset <= 0 && minOffset <= 0)
+                return CalculatePathBidirectional(world, start, goal, ct);
+
             // Round start coordinates for easier calculation
             Location startLower = start.ToFloor();
             Location goalLower = goal.ToFloor();
 
-            // We always use distance squared so our limits must also be squared.
-            minOffset *= minOffset;
-            maxOffset *= maxOffset;
+            // H/G scores are real distances scaled by MoveCostScale, so offsets
+            // must use the same scale.
+            minOffset *= MoveCostScale;
+            maxOffset *= MoveCostScale;
 
             // Prepare variables and datastructures for A*
 
             // Dictionary that contains the relation between all coordinates and resolves the final path
             Dictionary<Location, Location> cameFrom = new();
-            // Create a Binary Heap for all open positions => Allows fast access to Nodes with lowest scores
-            BinaryHeap openSet = new();
+            // Priority queue of (location, gScore) ordered by fScore; stale entries
+            // are skipped via lazy deletion against gScoreDict.
+            PriorityQueue<(Location Loc, int G), int> openSet = new();
             // Dictionary to keep track of the G-Score of every location
             Dictionary<Location, int> gScoreDict = new();
+            Location? closestNode = null;
+            int closestH = int.MaxValue;
 
             // Set start values for variables
-            openSet.Insert(0, (int)startLower.DistanceSquared(goalLower), startLower);
+            LastExpandedNodes = 0;
+            openSet.Enqueue((startLower, 0), Heuristic(startLower, goalLower));
             gScoreDict[startLower] = 0;
-            BinaryHeap.Node? current = null;
+            Location current = startLower;
 
             // Start of A*
 
             // Execute while we have nodes to process and we are not cancelled
-            while (openSet.Count() > 0 && !ct.IsCancellationRequested)
+            while (openSet.Count > 0 && !ct.IsCancellationRequested)
             {
-                // Get the root node of the Binary Heap
-                // Node with the lowest F-Score or lowest H-Score on tie
-                current = openSet.GetRootLocation();
+                // Pop the lowest F-score entry; skip stale ones (lazy deletion)
+                if (!openSet.TryDequeue(out var entry, out _))
+                    break;
+                if (!gScoreDict.TryGetValue(entry.Loc, out int entryG) || entryG != entry.G)
+                    continue;
+                current = entry.Loc;
+                LastExpandedNodes++;
+
+                int currentH = Heuristic(current, goalLower);
+                if (currentH < closestH)
+                {
+                    closestH = currentH;
+                    closestNode = current;
+                }
 
                 // Return if goal found and no maxOffset was given OR current node is between minOffset and maxOffset
-                if ((current.Location == goalLower && maxOffset <= 0) ||
-                    (maxOffset > 0 && current.HScore >= minOffset && current.HScore <= maxOffset))
-                    return SimplifyPath(world, ReconstructPath(cameFrom, current.Location, start, goal));
+                if ((current == goalLower && maxOffset <= 0) ||
+                    (maxOffset > 0 && currentH >= minOffset && currentH <= maxOffset))
+                    return SimplifyPath(world, ReconstructPath(cameFrom, current, start, goal));
 
                 // Discover neighbored blocks
-                foreach (Location neighbor in GetAvailableMoves(world, current.Location, allowUnsafe))
+                foreach (Location neighbor in GetJumpPointNeighbors(world, current, goalLower, allowUnsafe))
                 {
                     // If we are cancelled: break
                     if (ct.IsCancellationRequested)
                         break;
 
                     // tentative_GScore is the distance from start to the neighbor through current
-                    int tentativeGScore = current.GScore + (int)current.Location.DistanceSquared(neighbor);
+                    int tentativeGScore = entryG + MoveCost(current, neighbor);
 
                     // If the neighbor is not in the GScoreDict OR its current tentativeGScore is lower than the previously saved one: 
                     if (!gScoreDict.TryGetValue(neighbor, out int existingGScore) ||
                         tentativeGScore < existingGScore)
                     {
                         // Save the new relation between the neighbored block and the current one
-                        cameFrom[neighbor] = current.Location;
+                        cameFrom[neighbor] = current;
                         gScoreDict[neighbor] = tentativeGScore;
 
-                        // If this location is not already included in the Binary Heap: save it
-                        if (!openSet.ContainsLocation(neighbor))
-                            openSet.Insert(tentativeGScore, (int)neighbor.DistanceSquared(goalLower), neighbor);
+                        openSet.Enqueue((neighbor, tentativeGScore), tentativeGScore + Heuristic(neighbor, goalLower));
                     }
                 }
             }
 
             // Goal could not be reached. Set the path to the closest location if close enough
-            if (current is not null && openSet.MinHScoreNode is not null &&
-                (maxOffset == int.MaxValue || openSet.MinHScoreNode.HScore <= maxOffset))
-                return SimplifyPath(world, ReconstructPath(cameFrom, openSet.MinHScoreNode.Location, start, goal));
+            if (closestNode is not null &&
+                (maxOffset == int.MaxValue || closestH <= maxOffset))
+                return SimplifyPath(world, ReconstructPath(cameFrom, closestNode.Value, start, goal));
 
             return null;
+        }
+
+        /// <summary>
+        /// Bidirectional A*: expands from the start (JPS) and from the goal
+        /// (reverse-neighbor expansion) until the frontiers meet. For long
+        /// winding mazes this explores dramatically fewer nodes than a single
+        /// forward search.
+        /// </summary>
+        private static Queue<Location>? CalculatePathBidirectional(
+            World world, Location start, Location goal, CancellationToken ct)
+        {
+            Location startLower = start.ToFloor();
+            Location goalLower = goal.ToFloor();
+
+            PriorityQueue<(Location Loc, int G), int> openForward = new();
+            Dictionary<Location, Location> cameFromForward = new();
+            Dictionary<Location, int> gForward = new();
+            openForward.Enqueue((startLower, 0), Heuristic(startLower, goalLower));
+            gForward[startLower] = 0;
+
+            PriorityQueue<(Location Loc, int G), int> openBackward = new();
+            Dictionary<Location, Location> cameFromBackward = new();
+            Dictionary<Location, int> gBackward = new();
+            openBackward.Enqueue((goalLower, 0), Heuristic(goalLower, startLower));
+            gBackward[goalLower] = 0;
+
+            HashSet<Location> closedForward = new();
+            HashSet<Location> closedBackward = new();
+            Location? meeting = null;
+            int meetingCost = int.MaxValue;
+
+            while (openForward.Count > 0 && openBackward.Count > 0 && !ct.IsCancellationRequested)
+            {
+                if (!openForward.TryPeek(out _, out int fForward)
+                    || !openBackward.TryPeek(out _, out int fBackward))
+                    break;
+
+                if (meeting is not null)
+                {
+                    int minF = Math.Min(fForward, fBackward);
+                    if (minF >= meetingCost)
+                        break;
+                }
+
+                if (fForward <= fBackward)
+                {
+                    if (!openForward.TryDequeue(out var entry, out _))
+                        break;
+                    if (!gForward.TryGetValue(entry.Loc, out int entryG) || entryG != entry.G)
+                        continue;
+                    if (!closedForward.Add(entry.Loc))
+                        continue;
+                    LastExpandedNodes++;
+
+                    if (closedBackward.Contains(entry.Loc))
+                    {
+                        int cost = entryG + gBackward[entry.Loc];
+                        if (cost < meetingCost) { meetingCost = cost; meeting = entry.Loc; }
+                    }
+
+                    foreach (Location neighbor in GetJumpPointNeighbors(world, entry.Loc, goalLower, allowUnsafe: true))
+                    {
+                        if (ct.IsCancellationRequested)
+                            break;
+                        int tentativeG = entryG + MoveCost(entry.Loc, neighbor);
+                        if (!gForward.TryGetValue(neighbor, out int existing) || tentativeG < existing)
+                        {
+                            cameFromForward[neighbor] = entry.Loc;
+                            gForward[neighbor] = tentativeG;
+                            openForward.Enqueue((neighbor, tentativeG), tentativeG + Heuristic(neighbor, goalLower));
+                        }
+                    }
+                }
+                else
+                {
+                    if (!openBackward.TryDequeue(out var entry, out _))
+                        break;
+                    if (!gBackward.TryGetValue(entry.Loc, out int entryG) || entryG != entry.G)
+                        continue;
+                    if (!closedBackward.Add(entry.Loc))
+                        continue;
+                    LastExpandedNodes++;
+
+                    if (closedForward.Contains(entry.Loc))
+                    {
+                        int cost = entryG + gForward[entry.Loc];
+                        if (cost < meetingCost) { meetingCost = cost; meeting = entry.Loc; }
+                    }
+
+                    foreach (Location neighbor in GetReverseNeighbors(world, entry.Loc))
+                    {
+                        if (ct.IsCancellationRequested)
+                            break;
+                        int tentativeG = entryG + MoveCost(entry.Loc, neighbor);
+                        if (!gBackward.TryGetValue(neighbor, out int existing) || tentativeG < existing)
+                        {
+                            cameFromBackward[neighbor] = entry.Loc;
+                            gBackward[neighbor] = tentativeG;
+                            openBackward.Enqueue((neighbor, tentativeG), tentativeG + Heuristic(neighbor, startLower));
+                        }
+                    }
+                }
+            }
+
+            if (meeting is null)
+                return null;
+
+            // Reconstruct: start -> meeting (forward), then meeting -> goal (backward)
+            List<Location> path = new();
+            Location cur = meeting.Value;
+            path.Add(cur);
+            while (cameFromForward.TryGetValue(cur, out Location prev))
+            {
+                path.Add(prev);
+                cur = prev;
+            }
+            path.Reverse();
+            cur = meeting.Value;
+            while (cameFromBackward.TryGetValue(cur, out Location next))
+            {
+                path.Add(next);
+                cur = next;
+            }
+
+            // End at the exact requested position instead of the cell floor
+            if (path[^1] != goal && goal.DistanceSquared(path[^1]) <= 2.0)
+                path[^1] = goal;
+
+            return SimplifyPath(world, new Queue<Location>(path));
+        }
+
+        /// <summary>
+        /// Reverse-neighbor generation for the backward search: all cells that have
+        /// a forward edge into `node` (horizontal moves, step-up sources, and cells
+        /// that can fall or climb down onto it).
+        /// </summary>
+        private static IEnumerable<Location> GetReverseNeighbors(World world, Location node)
+        {
+            // 1. Horizontal reverse: M -> node where M = node - dir
+            foreach (Direction dir in new[]
+            {
+                Direction.East, Direction.West, Direction.North, Direction.South,
+                Direction.NorthEast, Direction.SouthEast, Direction.SouthWest, Direction.NorthWest
+            })
+            {
+                Location source = Move(node, Opposite(dir));
+                if (CanWalkHorizontally(world, source, dir))
+                    yield return source;
+            }
+
+            // 2. Step-up reverse: source = node - dir - Up where the forward
+            //    step-up edge source -> node exists.
+            foreach (Direction dir in new[] { Direction.East, Direction.West, Direction.North, Direction.South })
+            {
+                Location source = Move(Move(node, Opposite(dir)), Direction.Down);
+                if (CanStepUp(world, source, dir)
+                    && Move(Move(source, dir), Direction.Up) == node)
+                    yield return source;
+            }
+
+            // 3. Fall/climb reverse: the cell directly above can drop onto node.
+            Location above = Move(node, Direction.Up);
+            if (!IsOnGround(world, above) && !IsSwimming(world, above))
+                yield return above;
+        }
+
+        /// <summary>
+        /// Real movement cost between two adjacent locations, scaled to integers.
+        /// Cardinal/vertical moves cost 1000, diagonals cost ~1414.
+        /// </summary>
+        private static int MoveCost(Location from, Location to)
+        {
+            double dx = to.X - from.X;
+            double dy = to.Y - from.Y;
+            double dz = to.Z - from.Z;
+            return (int)Math.Round(MoveCostScale * Math.Sqrt(dx * dx + dy * dy + dz * dz));
+        }
+
+        /// <summary>
+        /// Admissible and consistent heuristic: scaled Euclidean distance.
+        /// The previous squared-distance heuristic massively overestimated H
+        /// (e.g. 26 blocks away scored 712 instead of ~26), turning A* into a
+        /// greedy search that timed out on large mazes.
+        /// </summary>
+        private static int Heuristic(Location from, Location to)
+        {
+            double dx = Math.Abs(to.X - from.X);
+            double dy = Math.Abs(to.Y - from.Y);
+            double dz = Math.Abs(to.Z - from.Z);
+            return (int)Math.Round(MoveCostScale * Math.Sqrt(dx * dx + dy * dy + dz * dz));
+        }
+
+        /// <summary>
+        /// JPS (Jump Point Search) neighbor generation: horizontal 8-direction jump
+        /// points plus per-node vertical transitions (step-up, fall, climb).
+        /// On open grid layers this prunes almost all intermediate cells, which is
+        /// what makes large multi-floor mazes searchable within a few seconds.
+        /// </summary>
+        private static IEnumerable<Location> GetJumpPointNeighbors(
+            World world, Location node, Location goal, bool allowUnsafe)
+        {
+            // Horizontal JPS in all 8 directions
+            foreach (Direction dir in new[]
+            {
+                Direction.East, Direction.West, Direction.North, Direction.South,
+                Direction.NorthEast, Direction.SouthEast, Direction.SouthWest, Direction.NorthWest
+            })
+            {
+                Location? jumpPoint = Jump(world, node, dir, goal);
+                if (jumpPoint is not null)
+                    yield return jumpPoint.Value;
+            }
+
+            // Walking off an edge into an unsupported air cell (starts a fall)
+            foreach (Direction dir in new[] { Direction.East, Direction.West, Direction.North, Direction.South })
+            {
+                Location side = Move(node, dir);
+                if (CanWalkHorizontally(world, node, dir) && !IsWalkableColumn(world, side))
+                {
+                    if (allowUnsafe || IsSafe(world, side))
+                        yield return side;
+                }
+            }
+
+            // Step-up transitions (1-high solid blocks)
+            foreach (Direction dir in new[] { Direction.East, Direction.West, Direction.North, Direction.South })
+            {
+                Location stepUp = Move(Move(node, dir), Direction.Up);
+                if (CanStepUp(world, node, dir) && (allowUnsafe || IsSafe(world, stepUp)))
+                    yield return stepUp;
+            }
+
+            // Same-column climbing / swimming up
+            if ((IsClimbing(world, node) || IsSwimming(world, node))
+                && CanMove(world, node, Direction.Up)
+                && (allowUnsafe || IsSafe(world, Move(node, Direction.Up))))
+            {
+                yield return Move(node, Direction.Up);
+            }
+
+            // Falling: continue downward while airborne (matches original behavior,
+            // which let falls proceed and only filtered destinations by safety)
+            if (!IsOnGround(world, node) && !IsSwimming(world, node))
+                yield return Move(node, Direction.Down);
+        }
+
+        /// <summary>
+        /// Jump in one direction to the next jump point: the goal, a forced
+        /// neighbor, a vertical transition, or the edge of the loaded map.
+        /// </summary>
+        private static Location? Jump(World world, Location from, Direction dir, Location goal)
+        {
+            Location next = Move(from, dir);
+            if (!PlayerFitsHere(world, next))
+                return null;
+            if (IsDiagonal(dir)
+                && (!PlayerFitsHere(world, Move(from, DiagonalCardinalA(dir)))
+                    || !PlayerFitsHere(world, Move(from, DiagonalCardinalB(dir)))))
+                return null;
+            return JumpRecursive(world, next, dir, goal);
+        }
+
+        private static Location? JumpRecursive(World world, Location next, Direction dir, Location goal)
+        {
+            // Solid or otherwise unenterable cell: the jump stops with no jump point
+            if (!PlayerFitsHere(world, next))
+                return null;
+
+            if (next == goal)
+                return next;
+
+            // A cell the body fits in but that has no ground support within the safe
+            // fall distance (or is not yet loaded) is an edge/void transition: stop
+            // the jump there so the search can enter it and start falling.
+            if (!IsWalkableColumn(world, next))
+                return next;
+
+            if (HasForcedNeighbor(world, next, dir))
+                return next;
+
+            if (IsDiagonal(dir))
+            {
+                // A diagonal jump must also stop where either cardinal component
+                // would find a jump point.
+                if (JumpRecursive(world, Move(next, DiagonalCardinalA(dir)), DiagonalCardinalA(dir), goal) != null
+                    || JumpRecursive(world, Move(next, DiagonalCardinalB(dir)), DiagonalCardinalB(dir), goal) != null)
+                    return next;
+            }
+
+            // Stop at cells where a vertical transition is possible: the bot must
+            // evaluate step-ups/climbing there instead of jumping past them.
+            if (HasVerticalTransition(world, next))
+                return next;
+
+            if (!CanWalkHorizontally(world, next, dir))
+                return null;
+            return JumpRecursive(world, Move(next, dir), dir, goal);
+        }
+
+        /// <summary>
+        /// Whether the player can move horizontally from `from` into the cell in
+        /// `dir`: body must fit (and for diagonals, both cardinal cells too) and
+        /// the destination must be inside a fully loaded chunk.
+        /// </summary>
+        private static bool CanWalkHorizontally(World world, Location from, Direction dir)
+        {
+            Location dest = Move(from, dir);
+            if (IsDiagonal(dir))
+            {
+                return PlayerFitsHere(world, dest)
+                    && PlayerFitsHere(world, Move(from, DiagonalCardinalA(dir)))
+                    && PlayerFitsHere(world, Move(from, DiagonalCardinalB(dir)));
+            }
+            return PlayerFitsHere(world, dest);
+        }
+
+        private static bool IsLoaded(World world, Location loc)
+        {
+            ChunkColumn? column = world.GetChunkColumn(loc);
+            return column is not null && column.FullyLoaded;
+        }
+
+        private static bool IsOpenCell(World world, Location cell)
+        {
+            return IsLoaded(world, cell) && PlayerFitsHere(world, cell);
+        }
+
+        /// <summary>
+        /// Classic JPS forced-neighbor test: a neighbor becomes newly reachable
+        /// through `dir` because of an obstacle.
+        /// </summary>
+        private static bool HasForcedNeighbor(World world, Location node, Direction dir)
+        {
+            if (IsDiagonal(dir))
+            {
+                Location diagonal = Move(node, dir);
+                return (!IsOpenCell(world, Move(node, DiagonalCardinalA(dir))) && IsOpenCell(world, diagonal))
+                    || (!IsOpenCell(world, Move(node, DiagonalCardinalB(dir))) && IsOpenCell(world, diagonal));
+            }
+            else
+            {
+                Direction perp = Perpendicular(dir);
+                Location diagonalA = Move(Move(node, dir), perp);
+                Location diagonalB = Move(Move(node, dir), Opposite(perp));
+                return (!IsOpenCell(world, Move(node, perp)) && IsOpenCell(world, diagonalA))
+                    || (!IsOpenCell(world, Move(node, Opposite(perp))) && IsOpenCell(world, diagonalB));
+            }
+        }
+
+        private static Direction Perpendicular(Direction direction)
+        {
+            return direction switch
+            {
+                Direction.East or Direction.West => Direction.North,
+                Direction.North or Direction.South => Direction.East,
+                _ => throw new ArgumentException("Not a cardinal direction", nameof(direction))
+            };
+        }
+
+        private static Direction Opposite(Direction direction)
+        {
+            return direction switch
+            {
+                Direction.East => Direction.West,
+                Direction.West => Direction.East,
+                Direction.North => Direction.South,
+                Direction.South => Direction.North,
+                Direction.NorthEast => Direction.SouthWest,
+                Direction.SouthWest => Direction.NorthEast,
+                Direction.NorthWest => Direction.SouthEast,
+                Direction.SouthEast => Direction.NorthWest,
+                _ => throw new ArgumentException("Not a cardinal direction", nameof(direction))
+            };
+        }
+
+        private static bool HasVerticalTransition(World world, Location node)
+        {
+            foreach (Direction dir in new[] { Direction.East, Direction.West, Direction.North, Direction.South })
+            {
+                if (CanStepUp(world, node, dir))
+                    return true;
+            }
+            return IsClimbing(world, node) || IsSwimming(world, node);
         }
 
         /// <summary>
@@ -357,8 +814,15 @@ namespace MinecraftClient.Mapping
             if (feetBlock.Type.IsSolid() || headBlock.Type.IsSolid())
                 return false;
 
-            // Climbable columns (ladders, vines) are walkable even when partially solid
-            return true;
+            // The column must have ground support within the safe fall distance
+            // (same rule as IsSafe), otherwise smoothing would collapse a path
+            // across a gap the player would fall through.
+            return world.GetBlock(Move(feet, Direction.Down)).Type.IsSolid()
+                || world.GetBlock(Move(feet, Direction.Down, 2)).Type.IsSolid()
+                || world.GetBlock(Move(feet, Direction.Down, 3)).Type.IsSolid()
+                || IsClimbing(world, Move(feet, Direction.Down))
+                || IsClimbing(world, Move(feet, Direction.Down, 2))
+                || IsClimbing(world, Move(feet, Direction.Down, 3));
         }
 
         /// <summary>
@@ -665,8 +1129,11 @@ namespace MinecraftClient.Mapping
         private static bool IsSafe(World world, Location location)
         {
             return
+                //The destination feet block itself must be passable
+                !world.GetBlock(location).Type.IsSolid()
+
                 //No block that can harm the player
-                !world.GetBlock(location).Type.CanHarmPlayers()
+                && !world.GetBlock(location).Type.CanHarmPlayers()
                 && !world.GetBlock(Move(location, Direction.Up)).Type.CanHarmPlayers()
                 && !world.GetBlock(Move(location, Direction.Down)).Type.CanHarmPlayers()
 
@@ -699,15 +1166,18 @@ namespace MinecraftClient.Mapping
                 case Direction.Down:
                     return IsClimbing(world, Move(location, Direction.Down)) || !IsOnGround(world, location);
                 case Direction.Up:
-                    bool nextTwoBlocks =
-                        !world.GetBlock(Move(Move(location, Direction.Up), Direction.Up)).Type.IsSolid();
-
-                    // Check if the current block can be climbed on
+                    // Same-column vertical moves are only valid when climbing or
+                    // swimming. A plain jump straight up lands on nothing: the
+                    // destination has no support block below it. Climbing stairs or
+                    // jumping out of pits uses the diagonal step-up moves instead.
                     if (IsClimbing(world, location))
-                        // Check if next block after the next one can be climbed upon
-                        return IsClimbing(world, Move(location, Direction.Up)) || nextTwoBlocks;
+                        return IsClimbing(world, Move(location, Direction.Up))
+                            || (!world.GetBlock(Move(location, Direction.Up)).Type.IsSolid()
+                                && !world.GetBlock(Move(Move(location, Direction.Up), Direction.Up)).Type.IsSolid());
 
-                    return (IsOnGround(world, location) || IsSwimming(world, location)) && nextTwoBlocks;
+                    return IsSwimming(world, location)
+                        && !world.GetBlock(Move(location, Direction.Up)).Type.IsSolid()
+                        && !world.GetBlock(Move(Move(location, Direction.Up), Direction.Up)).Type.IsSolid();
 
                 // Move horizontal
                 case Direction.East:
@@ -735,8 +1205,33 @@ namespace MinecraftClient.Mapping
                            PlayerFitsHere(world, Move(location, direction));
 
                 default:
-                    throw new ArgumentException("Unknown direction", nameof(direction));
+                throw new ArgumentException("Unknown direction", nameof(direction));
             }
+        }
+
+        /// <summary>
+        /// Check whether the player can step up onto a 1-high solid block in the
+        /// adjacent cell in the given direction: the step block provides support
+        /// at the destination feet level, and the player body fits at the top.
+        /// </summary>
+        private static bool CanStepUp(World world, Location location, Direction direction)
+        {
+            if (!IsOnGround(world, location) && !IsSwimming(world, location))
+                return false;
+
+            Location stepBlock = Move(location, direction);
+            Location destination = Move(stepBlock, Direction.Up);
+
+            // The step must be a full solid block whose top is exactly one level up
+            if (!world.GetBlock(stepBlock).Type.IsSolid())
+                return false;
+
+            // The player body must fit at the destination (feet block and head block)
+            if (world.GetBlock(destination).Type.IsSolid()
+                || world.GetBlock(Move(destination, Direction.Up)).Type.IsSolid())
+                return false;
+
+            return true;
         }
 
         /// <summary>

@@ -160,5 +160,58 @@ namespace MinecraftClient.Tests
             Assert.NotNull(path);
             Assert.True(path!.Count <= 3, $"Expected smoothed path (<=3 waypoints), got {path.Count}");
         }
+
+        [Fact]
+        public void CanMove_UpIntoSolidFeetBlock_ReturnsFalse()
+        {
+            World world = BuildWorld();
+            FillGround(world, 0, 0, 2, 2);
+            // Solid block in the destination feet column (Y+1)
+            world.SetBlock(new Location(1, FeetY + 1, 1), Stone);
+
+            bool result = Movement.CanMove(world, new Location(1, FeetY, 1), Direction.Up);
+
+            Assert.False(result);
+        }
+
+        [Fact]
+        public void CalculatePath_OneBlockPit_CanJumpOut()
+        {
+            World world = BuildWorld();
+            // 1-block-deep pit at (1,1): floor at FeetY-1, 1-high walls around
+            world.SetBlock(new Location(1, FeetY - 1, 1), Stone);
+            world.SetBlock(new Location(0, FeetY, 1), Stone);
+            world.SetBlock(new Location(2, FeetY, 1), Stone);
+            world.SetBlock(new Location(1, FeetY, 0), Stone);
+            world.SetBlock(new Location(1, FeetY, 2), Stone);
+            // Ground outside the pit so the bot can stand on the rim
+            FillGround(world, 2, 1, 4, 3);
+
+            Location start = new(1.5, FeetY, 1.5);
+            Location goal = new(3.5, FeetY + 1, 1.5);
+            Queue<Location>? path = Movement.CalculatePath(
+                world, start, goal, allowUnsafe: false, maxOffset: 0, minOffset: 0,
+                TimeSpan.FromSeconds(5));
+
+            Assert.NotNull(path);
+        }
+
+        [Fact]
+        public void CalculatePath_OneBlockStep_CanClimb()
+        {
+            World world = BuildWorld();
+            // Flat ground everywhere, with a single 1-high full block step at (2, FeetY, 1)
+            FillGround(world, 0, 0, 4, 3);
+            world.SetBlock(new Location(2, FeetY, 1), Stone);
+
+            Location start = new(1.5, FeetY, 1.5);
+            Location goal = new(2.5, FeetY + 1, 1.5);
+            Queue<Location>? path = Movement.CalculatePath(
+                world, start, goal, allowUnsafe: false, maxOffset: 0, minOffset: 0,
+                TimeSpan.FromSeconds(5));
+
+            Assert.NotNull(path);
+            Assert.Contains(path!, waypoint => waypoint.Y == FeetY + 1);
+        }
     }
 }

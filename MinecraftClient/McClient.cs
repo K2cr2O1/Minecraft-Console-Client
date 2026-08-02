@@ -83,6 +83,20 @@ namespace MinecraftClient
         private readonly MovementInput physicsInput = new();
         private bool physicsInitialized = false;
         private Location? pathTarget; // Current waypoint for physics-driven pathfinding
+        private CancellationTokenSource? pathSearchCts; // Async path search state
+        private Task<Queue<Location>?>? pathSearchTask;
+        private Location? movementGoal; // Original movement goal, kept for stuck re-planning
+        private bool movementAllowUnsafe;
+        private int movementMaxOffset;
+        private int movementMinOffset;
+        private double lastWaypointDistanceSqr = double.MaxValue;
+        private double lastReplanGoalDistanceSqr = double.MaxValue;
+        private int pathStuckTicks;
+        private int replanCount;
+        private const int PathStuckThresholdTicks = 60; // ~3 seconds at 20 TPS
+        private const int MaxReplansWithoutProgress = 5;
+        private const double PathProgressEpsilonSqr = 0.0025; // ~0.05 blocks of progress
+        private const double WaypointVerticalTolerance = 0.6; // roughly one block level
         public enum MovementType { Sneak, Walk, Sprint }
         private int sequenceId; // User for player block synchronization (Aka. digging, placing blocks, etc..)
         private bool CanSendMessage = false;
@@ -1777,17 +1791,46 @@ namespace MinecraftClient
                 if (allowDirectTeleport)
                 {
                     // 1-step path to the desired location without checking anything
+                    CancelPendingPathSearch();
                     UpdateLocation(goal, goal); // Update yaw and pitch to look at next step
                     handler.SendLocationUpdate(goal, Movement.IsOnGround(world, goal), false, _yaw, _pitch);
                     return true;
                 }
                 else
                 {
+                    movementGoal = goal;
+                    movementAllowUnsafe = allowUnsafe;
+                    movementMaxOffset = maxOffset;
+                    movementMinOffset = minOffset;
+                    replanCount = 0;
+                    lastReplanGoalDistanceSqr = goal.DistanceSquared(location);
                     pathTarget = null;
-                    path = Movement.CalculatePath(world, location, goal, allowUnsafe, maxOffset, minOffset, timeout ?? TimeSpan.FromSeconds(5));
-                    return path is not null;
+                    path = null;
+                    CancelPendingPathSearch();
+                    pathSearchCts = new CancellationTokenSource();
+                    pathSearchCts.CancelAfter(timeout ?? TimeSpan.FromSeconds(120));
+                    Location startLocation = location;
+                    pathSearchTask = Task.Run(
+                        () => Movement.CalculatePath(
+                            world, startLocation, goal, allowUnsafe, maxOffset, minOffset, pathSearchCts.Token),
+                        pathSearchCts.Token);
+                    ConsoleIO.WriteLineFormatted("§e[MCC] Searching for a path...");
+                    lastWaypointDistanceSqr = double.MaxValue;
+                    pathStuckTicks = 0;
+                    return true; // path is computed asynchronously
                 }
             }
+        }
+
+        /// <summary>
+        /// Cancel an in-flight asynchronous path search.
+        /// </summary>
+        private void CancelPendingPathSearch()
+        {
+            pathSearchCts?.Cancel();
+            pathSearchCts?.Dispose();
+            pathSearchCts = null;
+            pathSearchTask = null;
         }
 
         /// <summary>
@@ -3551,6 +3594,49 @@ namespace MinecraftClient
         {
             physicsInput.Reset();
 
+            // Adopt the result of an asynchronous path search when it completes
+            if (pathSearchTask is not null)
+            {
+                if (pathSearchTask.IsCompleted)
+                {
+                    Queue<Location>? result;
+                    try
+                    {
+                        result = pathSearchTask.Result;
+                    }
+                    catch (Exception ex)
+                    {
+                        ConsoleIO.WriteLineFormatted($"§c[MCC] Path search error: {ex.Message}");
+                        result = null;
+                    }
+                    pathSearchTask = null;
+                    pathSearchCts?.Dispose();
+                    pathSearchCts = null;
+
+                    path = result;
+                    if (path is not null && path.Count > 0)
+                    {
+                        pathTarget = path.Dequeue();
+                        ResetPathProgress(pathTarget.Value);
+                        replanCount = 0;
+                        ConsoleIO.WriteLineFormatted(
+                            $"§e[MCC] Path found ({path.Count} waypoints, nodes={Movement.LastExpandedNodes}).");
+                    }
+                    else
+                    {
+                        pathTarget = null;
+                        movementGoal = null;
+                        ConsoleIO.WriteLineFormatted(
+                            $"§c[MCC] Failed to compute path to target (nodes={Movement.LastExpandedNodes}). Run /move again.");
+                    }
+                }
+                else
+                {
+                    // Still searching: hold position
+                    return;
+                }
+            }
+
             // Still heading toward a target (even if path queue is empty)
             if (pathTarget is not null && ReachedWaypoint(pathTarget.Value))
             {
@@ -3558,6 +3644,7 @@ namespace MinecraftClient
                 if (path is not null && path.Count > 0)
                 {
                     pathTarget = path.Dequeue();
+                    ResetPathProgress(pathTarget.Value);
                     if (Config.Main.Advanced.MoveHeadWhileWalking)
                         UpdateLocation(location, pathTarget.Value + new Location(0, 1, 0));
                 }
@@ -3565,6 +3652,7 @@ namespace MinecraftClient
                 {
                     pathTarget = null;
                     path = null;
+                    movementGoal = null;
                 }
             }
             else if (pathTarget is not null && path is not null && path.Count > 0)
@@ -3576,9 +3664,12 @@ namespace MinecraftClient
                 double curDx = pathTarget.Value.X - location.X;
                 double curDz = pathTarget.Value.Z - location.Z;
                 if (curDx * curDx + curDz * curDz < 0.5625 &&
+                    Math.Abs(pathTarget.Value.Y - location.Y) < WaypointVerticalTolerance &&
+                    playerPhysics.OnGround &&
                     Movement.CanTravelStraight(world, location, next))
                 {
                     pathTarget = path.Dequeue();
+                    ResetPathProgress(pathTarget.Value);
                     if (Config.Main.Advanced.MoveHeadWhileWalking)
                         UpdateLocation(location, pathTarget.Value + new Location(0, 1, 0));
                 }
@@ -3588,14 +3679,97 @@ namespace MinecraftClient
             if (pathTarget is null && path is not null && path.Count > 0)
             {
                 pathTarget = path.Dequeue();
+                ResetPathProgress(pathTarget.Value);
                 if (Config.Main.Advanced.MoveHeadWhileWalking)
                     UpdateLocation(location, pathTarget.Value + new Location(0, 1, 0));
             }
 
             if (pathTarget is not null)
             {
+                // Stuck detection: the bot fell off the path or is blocked by a wall.
+                // Re-plan from the current position instead of jumping forever.
+                double dx = pathTarget.Value.X - location.X;
+                double dz = pathTarget.Value.Z - location.Z;
+                double distSqr = dx * dx + dz * dz;
+                if (distSqr < lastWaypointDistanceSqr - PathProgressEpsilonSqr)
+                {
+                    lastWaypointDistanceSqr = distSqr;
+                    pathStuckTicks = 0;
+                }
+                else if (playerPhysics.OnGround && pathStuckTicks > PathStuckThresholdTicks)
+                {
+                    ReplanMovement();
+                    return;
+                }
+                else if (playerPhysics.OnGround)
+                {
+                    // Only count stuck time while on the ground: airborne time is
+                    // legitimate jump/climb progress (e.g. escaping a 1-block pit).
+                    pathStuckTicks++;
+                }
+
                 SetInputToward(pathTarget.Value);
             }
+        }
+
+        /// <summary>
+        /// Remember the distance to the current waypoint so the stuck detector can
+        /// tell progress from standing still.
+        /// </summary>
+        private void ResetPathProgress(Location target)
+        {
+            double dx = target.X - location.X;
+            double dz = target.Z - location.Z;
+            lastWaypointDistanceSqr = dx * dx + dz * dz;
+            pathStuckTicks = 0;
+        }
+
+        /// <summary>
+        /// Recompute the path from the current position back to the original goal
+        /// after the bot got stuck or fell off the previous path.
+        /// </summary>
+        private void ReplanMovement()
+        {
+            if (movementGoal is not Location goal)
+            {
+                path = null;
+                pathTarget = null;
+                return;
+            }
+
+            double goalDistanceSqr = goal.DistanceSquared(location);
+            if (goalDistanceSqr < lastReplanGoalDistanceSqr - 1.0)
+            {
+                // More than one block of net progress toward the goal since the last
+                // re-plan: the re-plans are helping, so give the bot fresh attempts.
+                lastReplanGoalDistanceSqr = goalDistanceSqr;
+                replanCount = 0;
+            }
+
+            if (++replanCount > MaxReplansWithoutProgress)
+            {
+                path = null;
+                pathTarget = null;
+                movementGoal = null;
+                replanCount = 0;
+                ConsoleIO.WriteLineFormatted("§c[MCC] Movement cancelled: cannot escape the current position after repeated retries. Run /move again.");
+                return;
+            }
+
+            // Recompute asynchronously with the full budget instead of blocking the
+            // client for a few seconds (the maze search needs much more than 2s).
+            ConsoleIO.WriteLineFormatted("§e[MCC] Movement stuck; recomputing path in the background...");
+            path = null;
+            pathTarget = null;
+            CancelPendingPathSearch();
+            pathSearchCts = new CancellationTokenSource();
+            pathSearchCts.CancelAfter(TimeSpan.FromSeconds(120));
+            Location startLocation = location;
+            pathSearchTask = Task.Run(
+                () => Movement.CalculatePath(
+                    world, startLocation, goal, movementAllowUnsafe, movementMaxOffset, movementMinOffset,
+                    pathSearchCts.Token),
+                pathSearchCts.Token);
         }
 
         /// <summary>
@@ -3605,7 +3779,23 @@ namespace MinecraftClient
         {
             double dx = target.X - location.X;
             double dz = target.Z - location.Z;
-            return dx * dx + dz * dz < 0.49; // within ~0.7 blocks horizontally
+            if (dx * dx + dz * dz >= 0.49)
+                return false; // not within ~0.7 blocks horizontally
+
+            // Waypoints sit at block centers (Y+0.5) while the bot stands on the
+            // block top (feet at Y+1), so use an absolute tolerance: the bot is
+            // "at" a waypoint when within ~0.6 blocks vertically in either direction.
+            double dy = target.Y - location.Y;
+            if (Math.Abs(dy) >= WaypointVerticalTolerance)
+                return false;
+
+            // Must actually be standing/climbing/swimming at that level. Advancing
+            // mid-jump makes the bot fly past 1-high stair steps and fall off the
+            // unprotected edge before it ever lands on the step top.
+            return playerPhysics.OnGround
+                || playerPhysics.InWater
+                || playerPhysics.OnClimbable
+                || playerPhysics.VerticalCollisionBelow;
         }
 
         /// <summary>
@@ -3621,17 +3811,88 @@ namespace MinecraftClient
 
             if (distSqr < 0.01) return; // Close enough horizontally
 
-            // Calculate yaw to face target
-            float targetYaw = (float)(-Math.Atan2(dx, dz) / Math.PI * 180.0);
+            // Stay centered on 1-wide catwalks/platforms: when the current cell has
+            // cliffs on both sides of an axis, blend the heading with a correction
+            // back to the cell center so the bot walks the centerline instead of
+            // hugging an edge and clipping corner gaps.
+            double steerX = 0;
+            double steerZ = 0;
+            if (playerPhysics.OnGround)
+            {
+                double centerX = Math.Floor(location.X) + 0.5;
+                double centerZ = Math.Floor(location.Z) + 0.5;
+                double offX = centerX - location.X;
+                double offZ = centerZ - location.Z;
+                if (Math.Abs(offX) > 0.25
+                    && IsCliffSide(world, location, Direction.East)
+                    && IsCliffSide(world, location, Direction.West))
+                {
+                    steerX = offX * 1.0;
+                }
+                if (Math.Abs(offZ) > 0.25
+                    && IsCliffSide(world, location, Direction.North)
+                    && IsCliffSide(world, location, Direction.South))
+                {
+                    steerZ = offZ * 1.0;
+                }
+            }
+
+            // Calculate yaw to face target (with centerline correction)
+            float targetYaw = (float)(-Math.Atan2(dx + steerX, dz + steerZ) / Math.PI * 180.0);
             if (targetYaw < 0) targetYaw += 360;
             playerPhysics.Yaw = targetYaw;
             playerYaw = targetYaw;
 
             physicsInput.Forward = true;
 
-            // Jump if target is above and we're on ground
-            if (dy > 0.5 && playerPhysics.OnGround)
-                physicsInput.Jump = true;
+            // Vanilla-style auto-jump: hop only when a 1-high step actually blocks
+            // forward motion. This climbs connected stairs smoothly instead of
+            // sprint-jumping every step (which overshoots and falls off the top).
+            if (playerPhysics.OnGround && physicsInput.Forward)
+            {
+                double yawRad = playerYaw * (Math.PI / 180.0);
+                double forwardX = -Math.Sin(yawRad);
+                double forwardZ = Math.Cos(yawRad);
+                Location aheadBlock = new(
+                    Math.Floor(location.X + forwardX * 0.7),
+                    Math.Floor(location.Y),
+                    Math.Floor(location.Z + forwardZ * 0.7));
+                if (world.GetBlock(aheadBlock).Type.IsSolid()
+                    && !world.GetBlock(Movement.Move(aheadBlock, Direction.Up)).Type.IsSolid()
+                    && !world.GetBlock(Movement.Move(aheadBlock, Direction.Up, 2)).Type.IsSolid())
+                {
+                    physicsInput.Jump = true;
+                    // A step-up more than one block away horizontally (e.g. a
+                    // diagonal approach) exceeds walking-jump reach; sprint-jump it.
+                    if (distSqr > 1.0)
+                        physicsInput.Sprint = true;
+                }
+            }
+
+            // Edge probe: never walk forward into a cell with no ground within
+            // 2 blocks below it. On 1-wide platforms (rooftops, catwalks) the path
+            // may lead straight toward or past the edge; stepping off must be
+            // detected before the bot falls. 1-2 block drops stay allowed (the
+            // physics handles those), deeper drops are treated as cliffs.
+            if (playerPhysics.OnGround && physicsInput.Forward)
+            {
+                double yawRad = playerYaw * (Math.PI / 180.0);
+                double forwardX = -Math.Sin(yawRad);
+                double forwardZ = Math.Cos(yawRad);
+                Location currentCell = new(
+                    Math.Floor(location.X), Math.Floor(location.Y), Math.Floor(location.Z));
+                Location aheadCell = new(
+                    Math.Floor(location.X + forwardX * 0.7),
+                    Math.Floor(location.Y),
+                    Math.Floor(location.Z + forwardZ * 0.7));
+                if (aheadCell != currentCell
+                    && !world.GetBlock(aheadCell).Type.IsSolid()
+                    && !world.GetBlock(Movement.Move(aheadCell, Direction.Down)).Type.IsSolid()
+                    && !world.GetBlock(Movement.Move(aheadCell, Direction.Down, 2)).Type.IsSolid())
+                {
+                    physicsInput.Forward = false;
+                }
+            }
 
             // Map MovementSpeed setting: 1=sneak, 2-4=walk, 5=sprint
             if (Config.Main.Advanced.MovementSpeed >= 5)
@@ -3641,12 +3902,27 @@ namespace MinecraftClient
         }
 
         /// <summary>
+        /// Check whether the adjacent cell in the given direction is a cliff:
+        /// non-solid at feet level with no ground within 2 blocks below it.
+        /// </summary>
+        private bool IsCliffSide(World world, Location location, Direction direction)
+        {
+            Location side = Movement.Move(location, direction);
+            if (world.GetBlock(side).Type.IsSolid())
+                return false; // wall, not a cliff
+
+            return !world.GetBlock(Movement.Move(side, Direction.Down)).Type.IsSolid()
+                && !world.GetBlock(Movement.Move(side, Direction.Down, 2)).Type.IsSolid();
+        }
+
+        /// <summary>
         /// Check if the client is currently processing a Movement.
         /// </summary>
         /// <returns>true if a movement is currently handled</returns>
         public bool ClientIsMoving()
         {
-            return terrainAndMovementsEnabled && locationReceived && path is not null && path.Count > 0;
+            return terrainAndMovementsEnabled && locationReceived
+                && (path is not null && path.Count > 0 || pathSearchTask is not null);
         }
 
         /// <summary>
@@ -3655,6 +3931,8 @@ namespace MinecraftClient
         /// <returns>Current goal of movement. Location.Zero if not set.</returns>
         public Location GetCurrentMovementGoal()
         {
+            if (pathSearchTask is not null && movementGoal is Location pendingGoal)
+                return pendingGoal;
             return (ClientIsMoving() || path is null) ? Location.Zero : path.Last();
         }
 
@@ -3666,6 +3944,9 @@ namespace MinecraftClient
         {
             bool success = ClientIsMoving();
             path = null;
+            pathTarget = null;
+            movementGoal = null;
+            CancelPendingPathSearch();
             return success;
         }
 
