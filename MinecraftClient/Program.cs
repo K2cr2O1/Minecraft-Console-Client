@@ -779,15 +779,19 @@ namespace MinecraftClient
             else
             {
                 // Validate cached session or login new session.
-                if (Config.Main.Advanced.SessionCache != CacheType.none && SessionCache.Contains(loginLower) && Config.Main.General.AccountType != LoginType.yggdrasil)
+                // Contributor: K2cr2O1
+                // Modification-Date: 2026-08-06
+                // Brief-Description: 允许 Yggdrasil 账号走 SessionCache 验证并补充 token 刷新分支
+                if (Config.Main.Advanced.SessionCache != CacheType.none && SessionCache.Contains(loginLower))
                 {
                     session = SessionCache.Get(loginLower);
                     result = ProtocolHandler.GetTokenValidation(session);
                     if (result != ProtocolHandler.LoginResult.Success)
                     {
                         ConsoleIO.WriteLineFormatted("§8" + Translations.mcc_session_invalid, acceptnewlines: true);
-                        // Try to refresh access token
-                        if (!string.IsNullOrWhiteSpace(session.RefreshToken))
+
+                        if (Config.Main.General.AccountType == LoginType.microsoft
+                            && !string.IsNullOrWhiteSpace(session.RefreshToken))
                         {
                             try
                             {
@@ -796,6 +800,20 @@ namespace MinecraftClient
                             catch (Exception ex)
                             {
                                 ConsoleIO.WriteLine("Refresh access token fail: " + ex.Message);
+                                result = ProtocolHandler.LoginResult.InvalidResponse;
+                            }
+                        }
+                        else if (Config.Main.General.AccountType == LoginType.yggdrasil
+                                 && !string.IsNullOrWhiteSpace(session.ID))
+                        {
+                            // Yggdrasil 用 accessToken 调 /authserver/refresh
+                            try
+                            {
+                                result = ProtocolHandler.GetNewYggdrasilToken(session, out session);
+                            }
+                            catch (Exception ex)
+                            {
+                                ConsoleIO.WriteLine("Refresh Yggdrasil access token fail: " + ex.Message);
                                 result = ProtocolHandler.LoginResult.InvalidResponse;
                             }
                         }
